@@ -25,7 +25,8 @@ export async function initDB() {
         expires_at    BIGINT,
         notify_channel TEXT,
         notify_guild   TEXT,
-        mentions      INTEGER DEFAULT 0
+        mentions      INTEGER DEFAULT 0,
+        guild_scope   TEXT    DEFAULT 'global'
       );
 
       CREATE TABLE IF NOT EXISTS snow_store (
@@ -52,6 +53,12 @@ export async function initDB() {
         lang    TEXT DEFAULT 'en'
       );
     `);
+
+    // Migration: add guild_scope column if it doesn't exist (for existing deployments)
+    await pool.query(`
+      ALTER TABLE afk_store ADD COLUMN IF NOT EXISTS guild_scope TEXT DEFAULT 'global';
+    `).catch(() => {/* column may already exist */});
+
     console.log('✅  Neon DB — tables ready.');
   } catch (e) {
     console.error('❌  DB init error:', e.message);
@@ -68,16 +75,30 @@ export const DB = {
     } catch { return null; }
   },
 
-  async afkSet(userId, reason, startedAt, expiresAt = null, notifyChannel = null, notifyGuild = null) {
+  /** Returns AFK only if it applies to the given guild (global or guild-scoped) */
+  async afkGetForGuild(userId, guildId) {
+    try {
+      const r = await pool.query(
+        `SELECT * FROM afk_store WHERE user_id=$1 AND (guild_scope='global' OR guild_scope=$2)`,
+        [userId, guildId],
+      );
+      return r.rows[0] ?? null;
+    } catch { return null; }
+  },
+
+  /**
+   * guildScope: 'global' (all servers) or a guild_id string (server-only)
+   */
+  async afkSet(userId, reason, startedAt, expiresAt = null, notifyChannel = null, notifyGuild = null, guildScope = 'global') {
     try {
       await pool.query(
         `INSERT INTO afk_store
-           (user_id, reason, started_at, expires_at, notify_channel, notify_guild, mentions)
-         VALUES ($1,$2,$3,$4,$5,$6,0)
+           (user_id, reason, started_at, expires_at, notify_channel, notify_guild, mentions, guild_scope)
+         VALUES ($1,$2,$3,$4,$5,$6,0,$7)
          ON CONFLICT (user_id) DO UPDATE
            SET reason=$2, started_at=$3, expires_at=$4,
-               notify_channel=$5, notify_guild=$6, mentions=0`,
-        [userId, reason, startedAt, expiresAt, notifyChannel, notifyGuild],
+               notify_channel=$5, notify_guild=$6, mentions=0, guild_scope=$7`,
+        [userId, reason, startedAt, expiresAt, notifyChannel, notifyGuild, guildScope],
       );
     } catch (e) { console.error('[DB] afkSet:', e.message); }
   },
