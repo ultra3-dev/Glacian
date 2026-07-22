@@ -14,10 +14,14 @@ import {
   Client, GatewayIntentBits, Partials, REST, Routes,
   SlashCommandBuilder, Events, ActivityType,
 } from 'discord.js';
-import { createCanvas, loadImage } from '@napi-rs/canvas';
+// FIX: Import GlobalFonts for emoji rendering support in canvas
+import { createCanvas, loadImage, GlobalFonts } from '@napi-rs/canvas';
 import OpenAI from 'openai';
 import { DB, initDB, snowGet } from './db.js';
 import { t, VALID_LANGS } from './i18n.js';
+
+// FIX: Load system fonts so emoji render correctly in canvas images
+GlobalFonts.loadSystemFonts();
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const PREFIX        = 'gn';
@@ -183,7 +187,7 @@ const TITLES = [
   { rank: 47, name: 'Ice Sovereign of Eternity', min: 155_520_000, color: 0xFF6F00, tier: 5 }, // ~1800d
   { rank: 48, name: 'Ruler of Permafrost',       min: 156_384_000, color: 0xBF360C, tier: 5 }, // ~1810d
   { rank: 49, name: 'The Last Glacier',          min: 157_248_000, color: 0xFF3D00, tier: 5 }, // ~1820d
-  { rank: 50, name: "❄️ Glacian's Chosen ❄️",  min: 157_788_000, color: 0xFF1744, tier: 5 }, // 5yr EXACT
+  { rank: 50, name: "Glacian's Chosen",          min: 157_788_000, color: 0xFF1744, tier: 5 }, // 5yr EXACT
 ];
 
 function getTitle(pts, userId = null) {
@@ -236,6 +240,24 @@ function wrapLines(ctx, text, maxWidth) {
   }
   if (line) lines.push(line);
   return lines;
+}
+
+// FIX: Strip emoji variation selectors so canvas renders symbols correctly
+// on systems without full emoji fonts (e.g. Linux containers on Render).
+// The variation selector U+FE0F forces emoji presentation, but canvas needs
+// the base codepoint. We also replace common emoji with readable equivalents.
+function forCanvas(str) {
+  return str
+    .replace(/\uFE0F/g, '')       // strip emoji variation selector
+    .replace(/❄/g,  '*')          // snowflake → asterisk (fallback)
+    .replace(/❄️/g, '*')
+    .replace(/◈/g, '<>')
+    .replace(/✦/g, '+')
+    .replace(/👑/g, '[MONARCH]')
+    .replace(/🏆/g, '[#]')
+    .replace(/▶️/g, '>')
+    .replace(/✅/g, 'v')
+    .replace(/🔒/g, '-');
 }
 
 // ─── AI — CHAT & AFK MESSAGES ────────────────────────────────────────────────
@@ -309,10 +331,28 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+// FIX: Added forceStatic:true so animated avatars always produce a valid PNG URL
 async function fetchAvatar(user) {
   try {
-    const buf = await fetch(user.displayAvatarURL({ extension: 'png', size: 256 })).then(r => r.arrayBuffer());
+    const url = user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
+    if (!url) return null;
+    const buf = await fetch(url).then(r => r.arrayBuffer());
     return await loadImage(Buffer.from(buf));
+  } catch { return null; }
+}
+
+// FIX: Fetch avatar as raw buffer for Components V2 attachment uploads
+// Using attachment:// URLs is the most reliable way to show profile pictures
+// in Components V2 thumbnail (type 11) — CDN URLs can fail to render.
+async function fetchAvatarBuf(user) {
+  try {
+    const url = user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
+    if (!url) return null;
+    const ab = await fetch(url).then(r => {
+      if (!r.ok) return null;
+      return r.arrayBuffer();
+    });
+    return ab ? Buffer.from(ab) : null;
   } catch { return null; }
 }
 
@@ -506,7 +546,8 @@ async function generateSnowCard(user, sd) {
   drawAvatar(ctx,img,72,H/2,58,hex);
   drawChibiGlacian(ctx,W-62,H-55,.65,hex);
 
-  const tierLabel=isOwner?`  ◈  MONARCA DE LAS SOMBRAS  ◈  ABSOLUTE AUTHORITY  ◈`:`TIER ${title.tier}  ·  ${TIER_NAMES[title.tier]?.toUpperCase()??''}  ·  RANK #${title.rank}/50`;
+  const tierLabel=isOwner?`  <>  MONARCA DE LAS SOMBRAS  <>  ABSOLUTE AUTHORITY  <>`:
+    `TIER ${title.tier}  -  ${TIER_NAMES[title.tier]?.toUpperCase()??''}  -  RANK #${title.rank}/50`;
   ctx.fillStyle=hex+'22'; roundRect(ctx,148,22,isOwner?440:280,30,6); ctx.fill();
   ctx.font='bold 11px monospace'; ctx.fillStyle=hex; ctx.textAlign='left'; ctx.fillText(tierLabel,160,42);
 
@@ -515,9 +556,10 @@ async function generateSnowCard(user, sd) {
 
   ctx.font='bold 18px sans-serif'; ctx.fillStyle=hex;
   if(isOwner){ctx.shadowColor=hex; ctx.shadowBlur=16;}
-  ctx.fillText(title.name,148,120); ctx.shadowBlur=0;
+  // FIX: forCanvas() strips variation selectors so title names with emoji render
+  ctx.fillText(forCanvas(title.name),148,120); ctx.shadowBlur=0;
 
-  ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.4)'; ctx.fillText('❄  SNOW POINTS',148,152);
+  ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.4)'; ctx.fillText('* SNOW POINTS',148,152);
   ctx.font='bold 34px sans-serif'; ctx.fillStyle=isOwner?'#AA44FF':'#4FC3F7';
   ctx.shadowColor=isOwner?'#AA44FF':'#4FC3F7'; ctx.shadowBlur=10; ctx.fillText(fmtNum(sd.points),148,192); ctx.shadowBlur=0;
 
@@ -525,12 +567,12 @@ async function generateSnowCard(user, sd) {
   const prog=isOwner?1:next?Math.min(1,(sd.points-title.min)/(next.min-title.min)):1;
   drawProgressBar(ctx,BX,BY,BW,BH,prog,hex,nHex);
   ctx.font='11px monospace'; ctx.fillStyle='rgba(255,255,255,.35)';
-  ctx.textAlign='left'; ctx.fillText(title.name,BX,BY+BH+16);
-  ctx.textAlign='right'; ctx.fillText(isOwner?'◈  Absolute Rank  ◈':next?`${next.name}  (${fmtNum(next.min-sd.points)} pts)`:'✦ Max Rank',BX+BW,BY+BH+16);
+  ctx.textAlign='left'; ctx.fillText(forCanvas(title.name),BX,BY+BH+16);
+  ctx.textAlign='right'; ctx.fillText(isOwner?'<>  Absolute Rank  <>':next?`${forCanvas(next.name)}  (${fmtNum(next.min-sd.points)} pts)`:'Max Rank',BX+BW,BY+BH+16);
   ctx.textAlign='left'; ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.22)';
   ctx.fillText(`Sessions: ${fmtNum(sd.sessions)}   Total AFK: ${fmtDuration(sd.total_seconds)}`,BX,H-12);
   ctx.textAlign='right'; ctx.font='bold 13px monospace'; ctx.fillStyle=isOwner?'rgba(170,68,255,.4)':'rgba(79,195,247,.25)';
-  ctx.fillText(isOwner?'◈ GLACIAN':'❄ GLACIAN',W-90,H-12);
+  ctx.fillText(isOwner?'<> GLACIAN':'* GLACIAN',W-90,H-12);
   return canvas.toBuffer('image/png');
 }
 
@@ -548,14 +590,17 @@ async function generateAfkCard(user, reason, sd) {
   }
   const CX=W/2;
   ctx.fillStyle=hex+'33'; roundRect(ctx,CX-60,14,120,28,7); ctx.fill();
-  ctx.font='bold 12px monospace'; ctx.fillStyle=hex; ctx.textAlign='center'; ctx.fillText('❄  AFK ACTIVATED  ❄',CX,33);
+  ctx.font='bold 12px monospace'; ctx.fillStyle=hex; ctx.textAlign='center';
+  // FIX: no variation selector on snowflake
+  ctx.fillText('*  AFK ACTIVATED  *',CX,33);
 
   const img=await fetchAvatar(user);
   drawAvatar(ctx,img,CX,100,58,hex);
 
   ctx.font='bold 24px sans-serif'; ctx.fillStyle='#FFF'; ctx.textAlign='center';
   ctx.shadowColor='rgba(0,0,0,.8)'; ctx.shadowBlur=5; ctx.fillText(user.username.slice(0,24),CX,176); ctx.shadowBlur=0;
-  ctx.font='bold 14px sans-serif'; ctx.fillStyle=hex; ctx.shadowColor=hex; ctx.shadowBlur=8; ctx.fillText(title.name,CX,198); ctx.shadowBlur=0;
+  ctx.font='bold 14px sans-serif'; ctx.fillStyle=hex; ctx.shadowColor=hex; ctx.shadowBlur=8;
+  ctx.fillText(forCanvas(title.name),CX,198); ctx.shadowBlur=0;
 
   ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
   ctx.beginPath(); ctx.moveTo(CX-200,210); ctx.lineTo(CX+200,210); ctx.stroke();
@@ -565,17 +610,17 @@ async function generateAfkCard(user, reason, sd) {
   const lines=wrapLines(ctx,clean,680); const lineH=28; const maxL=4; let lineY=250;
   ctx.font='bold 20px sans-serif'; ctx.fillStyle='#FFF'; ctx.shadowColor='rgba(0,0,0,.6)'; ctx.shadowBlur=4;
   for(let i=0;i<Math.min(lines.length,maxL);i++){
-    let txt=lines[i]; if(i===maxL-1&&lines.length>maxL)txt+='…';
+    let txt=lines[i]; if(i===maxL-1&&lines.length>maxL)txt+='...';
     ctx.fillText(txt,CX,lineY); lineY+=lineH;
   }
   ctx.shadowBlur=0;
   const sepY=Math.max(lineY+6,326);
   ctx.strokeStyle='rgba(255,255,255,.07)'; ctx.beginPath(); ctx.moveTo(120,sepY); ctx.lineTo(W-120,sepY); ctx.stroke();
   ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.30)';
-  ctx.fillText(`❄  ${fmtNum(sd.points)} snow pts  ·  Session #${fmtNum(sd.sessions+1)}  ·  ${title.name}`,CX,sepY+18);
+  ctx.fillText(`*  ${fmtNum(sd.points)} snow pts  -  Session #${fmtNum(sd.sessions+1)}  -  ${forCanvas(title.name)}`,CX,sepY+18);
   drawChibiGlacian(ctx,W-55,H/2+10,.75,hex);
   ctx.font='bold 12px monospace'; ctx.fillStyle=isOwner?'rgba(170,68,255,.30)':'rgba(79,195,247,.20)';
-  ctx.fillText(isOwner?'◈ GLACIAN':'❄ GLACIAN',CX,H-10);
+  ctx.fillText(isOwner?'<> GLACIAN':'* GLACIAN',CX,H-10);
   return canvas.toBuffer('image/png');
 }
 
@@ -600,24 +645,24 @@ async function generateTitleRevealCard(user, sd) {
   if (isOwner) {
     ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(138,43,226,.6)'; ctx.textAlign='center';
     ctx.fillText('[ SYSTEM — STATUS NOTIFICATION ]',W/2,166);
-    ctx.save(); ctx.shadowColor='#AA44FF'; ctx.shadowBlur=40; ctx.font='48px sans-serif'; ctx.fillStyle='#AA44FF'; ctx.fillText('◈',W/2,210); ctx.restore();
+    ctx.save(); ctx.shadowColor='#AA44FF'; ctx.shadowBlur=40; ctx.font='48px sans-serif'; ctx.fillStyle='#AA44FF'; ctx.fillText('<>',W/2,210); ctx.restore();
     ctx.font='bold 38px sans-serif'; ctx.fillStyle='#CC66FF'; ctx.shadowColor='#8800CC'; ctx.shadowBlur=30;
     ctx.fillText('MONARCA DE LAS SOMBRAS',W/2,258); ctx.shadowBlur=0;
     ctx.font='bold 15px sans-serif'; ctx.fillStyle='rgba(100,120,255,.75)'; ctx.fillText('HAS EMERGED FROM THE ETERNAL ABYSS',W/2,284);
     ctx.strokeStyle='rgba(106,13,173,.4)'; ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(160,306);ctx.lineTo(W-160,306);ctx.stroke();
     ctx.font='13px monospace'; ctx.fillStyle='rgba(170,100,255,.55)';
-    ctx.fillText(`◈  Absolute Authority  ·  ${fmtNum(sd.points)} snow pts  ·  Sessions: ${fmtNum(sd.sessions)}`,W/2,332);
+    ctx.fillText(`<>  Absolute Authority  -  ${fmtNum(sd.points)} snow pts  -  Sessions: ${fmtNum(sd.sessions)}`,W/2,332);
     ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(106,13,173,.3)'; ctx.fillText('[ END OF NOTIFICATION ]',W/2,356);
-    ctx.font='bold 12px monospace'; ctx.fillStyle='rgba(170,68,255,.2)'; ctx.fillText('◈ GLACIAN',W/2,H-14);
+    ctx.font='bold 12px monospace'; ctx.fillStyle='rgba(170,68,255,.2)'; ctx.fillText('<> GLACIAN',W/2,H-14);
     return canvas.toBuffer('image/png');
   }
 
   ctx.font='bold 12px monospace'; ctx.fillStyle=hex+'AA'; ctx.textAlign='center';
-  ctx.fillText(`TIER ${title.tier}  ·  ${TIER_NAMES[title.tier]?.toUpperCase()??''}`,W/2,172);
+  ctx.fillText(`TIER ${title.tier}  -  ${TIER_NAMES[title.tier]?.toUpperCase()??''}`,W/2,172);
   const fs=title.name.length>22?30:38;
   ctx.font=`bold ${fs}px sans-serif`; ctx.fillStyle=hex; ctx.shadowColor=hex; ctx.shadowBlur=22;
-  ctx.fillText(title.name,W/2,220); ctx.shadowBlur=0;
+  ctx.fillText(forCanvas(title.name),W/2,220); ctx.shadowBlur=0;
   ctx.fillStyle=hex+'22'; roundRect(ctx,W/2-100,232,200,28,8); ctx.fill();
   ctx.font='bold 12px monospace'; ctx.fillStyle=hex; ctx.fillText(`RANK #${title.rank} / 50`,W/2,251);
   ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
@@ -630,15 +675,18 @@ async function generateTitleRevealCard(user, sd) {
   const prog=next?Math.min(1,(sd.points-title.min)/(next.min-title.min)):1;
   drawProgressBar(ctx,BX,BY,BW,BH,prog,hex,nHex);
   ctx.font='11px monospace'; ctx.fillStyle='rgba(255,255,255,.3)';
-  ctx.textAlign='left'; ctx.fillText(title.name,BX,BY+BH+14);
-  ctx.textAlign='right'; ctx.fillText(next?`${next.name} (${fmtNum(next.min-sd.points)} pts)`:'✦ Max Rank',BX+BW,BY+BH+14);
+  ctx.textAlign='left'; ctx.fillText(forCanvas(title.name),BX,BY+BH+14);
+  ctx.textAlign='right'; ctx.fillText(next?`${forCanvas(next.name)} (${fmtNum(next.min-sd.points)} pts)`:'Max Rank',BX+BW,BY+BH+14);
   ctx.textAlign='center'; ctx.font='13px monospace'; ctx.fillStyle='rgba(255,255,255,.25)';
-  ctx.fillText(`❄  ${fmtNum(sd.points)} snow pts  ·  Sessions: ${fmtNum(sd.sessions)}`,W/2,H-28);
-  ctx.font='bold 12px monospace'; ctx.fillStyle='rgba(79,195,247,.2)'; ctx.fillText('❄ GLACIAN',W/2,H-12);
+  ctx.fillText(`*  ${fmtNum(sd.points)} snow pts  -  Sessions: ${fmtNum(sd.sessions)}`,W/2,H-28);
+  ctx.font='bold 12px monospace'; ctx.fillStyle='rgba(79,195,247,.2)'; ctx.fillText('* GLACIAN',W/2,H-12);
   return canvas.toBuffer('image/png');
 }
 
 // ─── DISCORD COMPONENTS V2 BUILDERS ──────────────────────────────────────────
+// FIX: All accessory thumbnails now use attachment://avatar.png for guaranteed
+// rendering. CDN URLs sometimes fail in Components V2; attachment:// always works.
+
 function buildAfkSet(user, reason, startedAt, expiresAt, snow, title, aiMsg, lang) {
   const ts=Math.floor(startedAt/1000);
   const isOwner=user.id===OWNER_ID;
@@ -662,7 +710,8 @@ function buildAfkSet(user, reason, startedAt, expiresAt, snow, title, aiMsg, lan
     components: [{
       type:17, accent_color: isOwner?OWNER_TITLE.color:title.color,
       components: [
-        { type:9, components:[{type:10,content:body}], accessory:{type:11,media:{url:user.displayAvatarURL({extension:'png',size:256})},spoiler:false} },
+        // FIX: Use attachment://avatar.png instead of CDN URL for reliable display
+        { type:9, components:[{type:10,content:body}], accessory:{type:11,media:{url:'attachment://avatar.png'}} },
         { type:14, divider:true, spacing:1 },
         { type:10, content:foot },
         { type:1, components:[
@@ -678,23 +727,24 @@ function buildAfkMention(afkUser, afkData, currentMentions, lang) {
   const ts=Math.floor(afkData.started_at/1000);
   const elapsed=Math.floor((Date.now()-afkData.started_at)/1000);
   const isOwner=afkUser.id===OWNER_ID;
+  // FIX: Simplified mention — only shows "is AFK" as requested
+  // No buttons, no extra sections — clean and fast
   const body=[
     `## ${isOwner?'◈':'🌨️'}  **${afkUser.username}** is AFK`,
     ``,
-    `> 💤  **Reason:**             ${afkData.reason}`,
-    `> 🕐  **Since:**              <t:${ts}:T>  —  <t:${ts}:R>`,
-    `> ⏱️  **Time away:**          ${fmtDuration(elapsed)}`,
-    `> 📨  **Mentions received:**  ${currentMentions}`,
+    `> 💤  **Reason:**  ${afkData.reason}`,
+    `> 🕐  **Since:**   <t:${ts}:T>  —  <t:${ts}:R>`,
+    `> ⏱️  **Away for:** ${fmtDuration(elapsed)}`,
   ].join('\n');
   return {
     flags:IS_CV2,
     components:[{
       type:17, accent_color:isOwner?OWNER_TITLE.color:0x4FC3F7,
       components:[
-        {type:9,components:[{type:10,content:body}],accessory:{type:11,media:{url:afkUser.displayAvatarURL({extension:'png',size:256})},spoiler:false}},
+        // FIX: Use attachment://avatar.png for reliable profile picture
+        {type:9,components:[{type:10,content:body}],accessory:{type:11,media:{url:'attachment://avatar.png'}}},
         {type:14,divider:true,spacing:1},
-        {type:10,content:`-# Glacian will notify when **${afkUser.username}** returns ❄️`},
-        {type:1,components:[{type:2,style:2,label:'❄️  Snow Card',custom_id:`snow::${afkUser.id}`}]},
+        {type:10,content:`-# Glacian notifies when **${afkUser.username}** returns ❄️`},
       ],
     }],
   };
@@ -729,7 +779,8 @@ function buildAfkReturn(user, durationSec, mentions, sd, aiMsg, lang) {
     components:[{
       type:17,accent_color:isOwner?OWNER_TITLE.color:title.color,
       components:[
-        {type:9,components:[{type:10,content:body}],accessory:{type:11,media:{url:user.displayAvatarURL({extension:'png',size:256})},spoiler:false}},
+        // FIX: Use attachment://avatar.png for reliable profile picture
+        {type:9,components:[{type:10,content:body}],accessory:{type:11,media:{url:'attachment://avatar.png'}}},
         {type:14,divider:true,spacing:1},
         {type:10,content:foot},
         {type:1,components:[
@@ -844,6 +895,20 @@ async function sendV2(channelId, payload, replyToId=null) {
   if(replyToId){body.message_reference={message_id:replyToId};body.allowed_mentions={parse:[],replied_user:false};}
   return rest.post(Routes.channelMessages(channelId),{body});
 }
+
+// FIX: Multi-file send — uploads avatar + optional card image as attachments.
+// This ensures attachment://avatar.png is always valid in the Components V2 payload.
+async function sendV2WithAvatar(channelId, payload, avatarBuf, cardBuf, cardName, replyToId=null) {
+  const body={...payload};
+  if(replyToId){body.message_reference={message_id:replyToId};body.allowed_mentions={parse:[],replied_user:false};}
+  const form=new FormData();
+  form.append('payload_json',JSON.stringify(body));
+  let fileIdx=0;
+  if(avatarBuf) form.append(`files[${fileIdx++}]`,new Blob([avatarBuf],{type:'image/png'}),'avatar.png');
+  if(cardBuf)   form.append(`files[${fileIdx++}]`,new Blob([cardBuf],{type:'image/png'}),cardName);
+  return rest.post(Routes.channelMessages(channelId),{body:form,passThroughBody:true});
+}
+
 async function sendV2File(channelId, payload, buf, name, replyToId=null) {
   const body={...payload};
   if(replyToId){body.message_reference={message_id:replyToId};body.allowed_mentions={parse:[],replied_user:false};}
@@ -852,6 +917,18 @@ async function sendV2File(channelId, payload, buf, name, replyToId=null) {
   form.append('files[0]',new Blob([buf],{type:'image/png'}),name);
   return rest.post(Routes.channelMessages(channelId),{body:form,passThroughBody:true});
 }
+
+// FIX: Edit helpers — used in handleReturn to EDIT instead of delete+resend
+async function editV2(channelId, messageId, payload) {
+  return rest.patch(Routes.channelMessage(channelId,messageId),{body:payload}).catch(()=>{});
+}
+async function editV2WithFile(channelId, messageId, payload, buf, name) {
+  const form=new FormData();
+  form.append('payload_json',JSON.stringify(payload));
+  form.append('files[0]',new Blob([buf],{type:'image/png'}),name);
+  return rest.patch(Routes.channelMessage(channelId,messageId),{body:form,passThroughBody:true}).catch(()=>{});
+}
+
 async function slashReply(interaction,payload) {
   return rest.post(Routes.interactionCallback(interaction.id,interaction.token),{body:{type:4,data:payload}});
 }
@@ -867,6 +944,17 @@ async function slashPatchFile(interaction,payload,buf,name) {
   form.append('files[0]',new Blob([buf],{type:'image/png'}),name);
   return rest.patch(Routes.webhookMessage(interaction.applicationId,interaction.token,'@original'),{body:form,passThroughBody:true});
 }
+
+// FIX: Slash reply with avatar + card files for reliable Components V2 thumbnails
+async function slashPatchWithAvatar(interaction,payload,avatarBuf,cardBuf,cardName) {
+  const form=new FormData();
+  form.append('payload_json',JSON.stringify(payload));
+  let fileIdx=0;
+  if(avatarBuf) form.append(`files[${fileIdx++}]`,new Blob([avatarBuf],{type:'image/png'}),'avatar.png');
+  if(cardBuf)   form.append(`files[${fileIdx++}]`,new Blob([cardBuf],{type:'image/png'}),cardName);
+  return rest.patch(Routes.webhookMessage(interaction.applicationId,interaction.token,'@original'),{body:form,passThroughBody:true});
+}
+
 async function slashButtonReply(interaction,payload) {
   return rest.post(Routes.interactionCallback(interaction.id,interaction.token),{body:{type:4,data:payload}});
 }
@@ -945,13 +1033,18 @@ async function handleTimerExpiry(userId) {
   const title=getTitle(sd.points,userId);
   const isOwner=userId===OWNER_ID;
 
-  // Generate title card
+  // FIX: Fetch user ONCE and reuse — avoid race condition / empty URL bug
+  const discordUser=await client.users.fetch(userId).catch(()=>null);
+  const avatarUrl=discordUser?.displayAvatarURL({extension:'png',size:256,forceStatic:true})||'';
+
+  // Generate title card using the real user object when possible
   let cardBuf=null;
-  try{cardBuf=await generateTitleRevealCard({id:userId,username:'User',displayAvatarURL:()=>''},sd);}catch{}
+  const fakeUser={id:userId,username:discordUser?.username||'User',displayAvatarURL:()=>avatarUrl};
+  try{cardBuf=await generateTitleRevealCard(fakeUser,sd);}catch(e){console.error('[Canvas timer]',e.message);}
 
   // Send DM with timer expired notification
   try{
-    const discordUser=await client.users.fetch(userId);
+    if(!discordUser)throw new Error('User not found');
     const dm=await discordUser.createDM();
     const timerPayload={
       flags:IS_CV2,
@@ -987,6 +1080,7 @@ async function handleTimerExpiry(userId) {
         components:[{
           type:17,accent_color:isOwner?OWNER_TITLE.color:title.color,
           components:[
+            // FIX: Use attachment://avatar.png — pre-fetched user avoids empty URL bug
             {type:9,components:[{type:10,content:[
               `## ⏱️  ${isOwner?'◈':'❄️'}  AFK Timer Expired — <@${userId}>`,
               ``,
@@ -994,13 +1088,19 @@ async function handleTimerExpiry(userId) {
               `> ❄️  **Snow Points:** +${fmtNum(durationSec)}`,
               ``,
               `**[ ${title.name.toUpperCase()} ]**\n-# *${flavor}*`,
-            ].join('\n')}],accessory:{type:11,media:{url:(await client.users.fetch(userId).catch(()=>null))?.displayAvatarURL({extension:'png',size:256})||''},spoiler:false}},
+            ].join('\n')}],accessory:{type:11,media:{url:'attachment://avatar.png'}}},
             {type:14,divider:true,spacing:1},
             {type:10,content:`-# Notified via DM 📬  ·  Snow Points added ✅`},
           ],
         }],
       };
-      await sendV2(afkData.notify_channel,channelPayload).catch(()=>{});
+      // FIX: Upload avatar as attachment so thumbnail renders correctly
+      const avatarBuf=await fetchAvatarBuf(discordUser).catch(()=>null);
+      if(avatarBuf){
+        await sendV2WithAvatar(afkData.notify_channel,channelPayload,avatarBuf,null,null).catch(()=>{});
+      } else {
+        await sendV2(afkData.notify_channel,channelPayload).catch(()=>{});
+      }
     }
   } catch(e){console.error('[Timer]',e.message);}
 }
@@ -1048,25 +1148,51 @@ async function cmdAfk({userId,guildId,guildName,reason,durationMs,user,channelId
   const sd=await snowGet(userId);
   const title=getTitle(sd.points,userId);
   const isOwner=userId===OWNER_ID;
-  const [aiMsg,cardBuf]=await Promise.all([
+
+  // FIX: Fetch avatar as buffer so attachment://avatar.png works in thumbnail
+  const [aiMsg,cardBuf,avatarBuf]=await Promise.all([
     aiAfkMessage(user.username,reason,isOwner),
     generateAfkCard(user,reason,sd).catch(()=>null),
+    fetchAvatarBuf(user).catch(()=>null),
   ]);
 
   const payload=buildAfkSet(user,reason,now,expiresAt,sd,title,aiMsg,lang);
 
-  const inject=(buf,name)=>{
+  // Inject the canvas card image into the components
+  const inject=(name)=>{
     payload.components[0].components.splice(1,0,{type:12,items:[{media:{url:`attachment://${name}`},description:`AFK: ${user.username}`}]});
-    return buf;
   };
 
   if(isSlash){
     await slashDefer(interaction).catch(()=>{});
-    if(cardBuf){inject(cardBuf,'afk-card.png');await slashPatchFile(interaction,payload,cardBuf,'afk-card.png').catch(async()=>slashPatch(interaction,{content:`❄️ AFK — *${reason}*`}).catch(()=>{}));}
-    else await slashPatch(interaction,payload).catch(()=>{});
+    if(cardBuf){
+      inject('afk-card.png');
+      await slashPatchWithAvatar(interaction,payload,avatarBuf,cardBuf,'afk-card.png')
+        .catch(async()=>slashPatch(interaction,{content:`❄️ AFK — *${reason}*`}).catch(()=>{}));
+    } else {
+      // No card but still send avatar for thumbnail
+      if(avatarBuf){
+        const form=new FormData();
+        form.append('payload_json',JSON.stringify(payload));
+        form.append('files[0]',new Blob([avatarBuf],{type:'image/png'}),'avatar.png');
+        await rest.patch(Routes.webhookMessage(interaction.applicationId,interaction.token,'@original'),{body:form,passThroughBody:true}).catch(()=>slashPatch(interaction,payload).catch(()=>{}));
+      } else {
+        await slashPatch(interaction,payload).catch(()=>{});
+      }
+    }
   } else {
-    if(cardBuf){inject(cardBuf,'afk-card.png');await sendV2File(channelId,payload,cardBuf,'afk-card.png',messageId).catch(()=>sendV2(channelId,payload,messageId).catch(()=>{}));}
-    else await sendV2(channelId,payload,messageId).catch(()=>{});
+    if(cardBuf){
+      inject('afk-card.png');
+      await sendV2WithAvatar(channelId,payload,avatarBuf,cardBuf,'afk-card.png',messageId)
+        .catch(()=>sendV2(channelId,payload,messageId).catch(()=>{}));
+    } else {
+      if(avatarBuf){
+        await sendV2WithAvatar(channelId,payload,avatarBuf,null,null,messageId)
+          .catch(()=>sendV2(channelId,payload,messageId).catch(()=>{}));
+      } else {
+        await sendV2(channelId,payload,messageId).catch(()=>{});
+      }
+    }
   }
 }
 
@@ -1123,27 +1249,46 @@ async function handleReturn(message) {
   await DB.afkDel(userId);
   const sd=await snowGet(userId);
 
-  const [aiMsg,cardBuf]=await Promise.all([
+  // FIX: Fetch avatar buffer so attachment:// thumbnail works in return card
+  const [aiMsg,cardBuf,avatarBuf]=await Promise.all([
     aiReturnMessage(message.author.username,fmtDuration(durationSec),mentions,isOwner),
     generateTitleRevealCard(message.author,sd).catch(()=>null),
+    fetchAvatarBuf(message.author).catch(()=>null),
   ]);
 
   const payload=buildAfkReturn(message.author,durationSec,mentions,sd,aiMsg,lang);
 
-  let returnMsg=null;
-  try{returnMsg=await sendV2(message.channel.id,payload,message.id);}catch{}
+  let returnMsgId=null;
+  try{
+    const sent=await sendV2WithAvatar(message.channel.id,payload,avatarBuf,null,null,message.id);
+    returnMsgId=sent?.id??null;
+  }catch(e){
+    console.error('[Return send]',e.message);
+  }
 
   const channelId=message.channel.id;
-  const retId=returnMsg?.id;
 
+  // FIX: EDIT the return message instead of deleting it and sending a new one
+  // This keeps the conversation clean — no message deletion, no ghost messages
   setTimeout(async()=>{
-    if(retId)await deleteMsg(channelId,retId);
     const titlePayload=buildTitleRevealMsg(message.author,sd);
-    if(cardBuf){
-      await sendV2File(channelId,titlePayload,cardBuf,'title-reveal.png').catch(()=>sendV2(channelId,titlePayload).catch(()=>{}));
+
+    if(returnMsgId){
+      // Edit the existing return message with the title reveal
+      if(cardBuf){
+        await editV2WithFile(channelId,returnMsgId,titlePayload,cardBuf,'title-reveal.png');
+      } else {
+        await editV2(channelId,returnMsgId,titlePayload);
+      }
     } else {
-      await sendV2(channelId,titlePayload).catch(()=>{});
+      // Fallback: send new message only if original return message wasn't sent
+      if(cardBuf){
+        await sendV2File(channelId,titlePayload,cardBuf,'title-reveal.png').catch(()=>sendV2(channelId,titlePayload).catch(()=>{}));
+      } else {
+        await sendV2(channelId,titlePayload).catch(()=>{});
+      }
     }
+
     // Send DM with mentions + title card
     await sendAfkEndDM(message.author,durationSec,lang,sd,cardBuf);
   }, 10_000);
@@ -1256,7 +1401,17 @@ client.on(Events.MessageCreate,async message=>{
         const member=await message.guild.members.fetch(mentioned.id).catch(()=>null);
         const dispUser=member?.user??mentioned;
         const lang=await DB.getLang(mentioned.id);
-        await sendV2(message.channel.id,buildAfkMention(dispUser,afkData,updated?.mentions??1,lang),message.id);
+        // FIX: Fetch avatar buffer for reliable thumbnail in mention card
+        const avatarBuf=await fetchAvatarBuf(dispUser).catch(()=>null);
+        const mentionPayload=buildAfkMention(dispUser,afkData,updated?.mentions??1,lang);
+        if(avatarBuf){
+          await sendV2WithAvatar(message.channel.id,mentionPayload,avatarBuf,null,null,message.id);
+        } else {
+          // Fallback: swap to CDN URL if avatar fetch failed
+          mentionPayload.components[0].components[0].accessory.media.url=
+            dispUser.displayAvatarURL({extension:'png',size:256,forceStatic:true});
+          await sendV2(message.channel.id,mentionPayload,message.id);
+        }
       }catch(e){console.error('[Mention]',e.message);}
     }
   }

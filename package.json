@@ -1,6 +1,6 @@
 {
   "name": "glacian-bot",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Glacian — Ultimate AFK bot with timed AFK, snow points, multi-language & canvas cards ❄️",
   "type": "module",
   "main": "index.js",
