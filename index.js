@@ -14,14 +14,28 @@ import {
   Client, GatewayIntentBits, Partials, REST, Routes,
   SlashCommandBuilder, Events, ActivityType,
 } from 'discord.js';
-// FIX: Import GlobalFonts for emoji rendering support in canvas
 import { createCanvas, loadImage, GlobalFonts } from '@napi-rs/canvas';
+import { createServer } from 'http';
 import OpenAI from 'openai';
 import { DB, initDB, snowGet } from './db.js';
 import { t, VALID_LANGS } from './i18n.js';
 
-// FIX: Load system fonts so emoji render correctly in canvas images
-GlobalFonts.loadSystemFonts();
+// ─── EMOJI FONT — download Noto Color Emoji so emojis render on Linux ─────────
+// Render's Ubuntu containers have no emoji font; we fetch it once at startup.
+async function initEmojiFont() {
+  try {
+    const FONT_URL = 'https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf';
+    const resp = await fetch(FONT_URL, { signal: AbortSignal.timeout(30_000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    GlobalFonts.register(buf, 'NotoColorEmoji');
+    console.log('✅  Noto Color Emoji font loaded — emojis will render in canvas.');
+  } catch (e) {
+    console.warn('⚠️  Could not load emoji font:', e.message, '— canvas will use fallback glyphs.');
+    // Still load whatever system fonts exist
+    GlobalFonts.loadSystemFonts();
+  }
+}
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const PREFIX        = 'gn';
@@ -123,8 +137,9 @@ const TITLE_FLAVOR = [
 // 5 years = 157,788,000 seconds | 1 pt = 1 second AFK
 const TIER_NAMES = ['', 'The Awakening', 'Crystal Depths', 'Void Ice', 'Rune Ice', 'Divine Zero'];
 
+// FIX: Owner title is now in English (was "Monarca de las Sombras")
 const OWNER_TITLE = {
-  rank: 0, name: '👑 Monarca de las Sombras', min: 0,
+  rank: 0, name: '👑 Monarch of Shadows', min: 0,
   color: 0x6A0DAD, tier: 0, isOwner: true, tierName: 'Absolute Authority',
 };
 
@@ -242,22 +257,11 @@ function wrapLines(ctx, text, maxWidth) {
   return lines;
 }
 
-// FIX: Strip emoji variation selectors so canvas renders symbols correctly
-// on systems without full emoji fonts (e.g. Linux containers on Render).
-// The variation selector U+FE0F forces emoji presentation, but canvas needs
-// the base codepoint. We also replace common emoji with readable equivalents.
+// FIX: forCanvas now only strips variation selectors (U+FE0F) so the base
+// emoji codepoints reach Skia/Noto Color Emoji and render as real glyphs.
+// No more ASCII replacements — emojis now show properly on canvas.
 function forCanvas(str) {
-  return str
-    .replace(/\uFE0F/g, '')       // strip emoji variation selector
-    .replace(/❄/g,  '*')          // snowflake → asterisk (fallback)
-    .replace(/❄️/g, '*')
-    .replace(/◈/g, '<>')
-    .replace(/✦/g, '+')
-    .replace(/👑/g, '[MONARCH]')
-    .replace(/🏆/g, '[#]')
-    .replace(/▶️/g, '>')
-    .replace(/✅/g, 'v')
-    .replace(/🔒/g, '-');
+  return str.replace(/\uFE0F/g, ''); // strip variation selector only
 }
 
 // ─── AI — CHAT & AFK MESSAGES ────────────────────────────────────────────────
@@ -331,7 +335,6 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-// FIX: Added forceStatic:true so animated avatars always produce a valid PNG URL
 async function fetchAvatar(user) {
   try {
     const url = user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
@@ -341,9 +344,6 @@ async function fetchAvatar(user) {
   } catch { return null; }
 }
 
-// FIX: Fetch avatar as raw buffer for Components V2 attachment uploads
-// Using attachment:// URLs is the most reliable way to show profile pictures
-// in Components V2 thumbnail (type 11) — CDN URLs can fail to render.
 async function fetchAvatarBuf(user) {
   try {
     const url = user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
@@ -530,163 +530,320 @@ function drawProgressBar(ctx, BX, BY, BW, BH, prog, hex1, hex2) {
   }
 }
 
-// ─── CANVAS 1: SNOW CARD ──────────────────────────────────────────────────────
+// ─── CANVAS — STAT PILL (reusable label+value row) ───────────────────────────
+function drawStatPill(ctx, x, y, w, label, value, accentHex) {
+  roundRect(ctx, x, y, w, 36, 8);
+  ctx.fillStyle = 'rgba(255,255,255,0.05)'; ctx.fill();
+  ctx.strokeStyle = accentHex + '33'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.font = 'bold 10px monospace'; ctx.fillStyle = 'rgba(255,255,255,.35)';
+  ctx.textAlign = 'left'; ctx.fillText(label.toUpperCase(), x + 10, y + 13);
+  ctx.font = 'bold 15px sans-serif'; ctx.fillStyle = '#FFF';
+  ctx.fillText(value, x + 10, y + 30);
+}
+
+// ─── CANVAS 1: SNOW CARD (redesigned — more organized) ────────────────────────
 async function generateSnowCard(user, sd) {
-  const W=900,H=320; const canvas=createCanvas(W,H); const ctx=canvas.getContext('2d');
+  const W=940, H=340;
+  const canvas=createCanvas(W,H); const ctx=canvas.getContext('2d');
   const isOwner=user.id===OWNER_ID;
   const title=getTitle(sd.points,user.id), next=getNext(sd.points,user.id);
   const hex=isOwner?hexColor(OWNER_TITLE.color):hexColor(title.color);
   const nHex=next?hexColor(next.color):hex;
 
-  drawBgForTitle(ctx,W,H,title); drawAccentBar(ctx,H,hex,nHex);
-  const gl=ctx.createLinearGradient(0,0,W,0); gl.addColorStop(0,'rgba(0,0,0,0)'); gl.addColorStop(.5,hex); gl.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=gl; ctx.fillRect(0,H-2,W,2);
+  // Background
+  drawBgForTitle(ctx,W,H,title);
 
+  // Top gradient line
+  const gl=ctx.createLinearGradient(0,0,W,0);
+  gl.addColorStop(0,'rgba(0,0,0,0)'); gl.addColorStop(.5,hex+'CC'); gl.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=gl; ctx.fillRect(0,0,W,3);
+
+  // Left accent bar
+  drawAccentBar(ctx,H,hex,nHex);
+
+  // Avatar
   const img=await fetchAvatar(user);
-  drawAvatar(ctx,img,72,H/2,58,hex);
-  drawChibiGlacian(ctx,W-62,H-55,.65,hex);
+  const AVX=76, AVY=H/2;
+  drawAvatar(ctx,img,AVX,AVY,58,hex);
 
-  const tierLabel=isOwner?`  <>  MONARCA DE LAS SOMBRAS  <>  ABSOLUTE AUTHORITY  <>`:
-    `TIER ${title.tier}  -  ${TIER_NAMES[title.tier]?.toUpperCase()??''}  -  RANK #${title.rank}/50`;
-  ctx.fillStyle=hex+'22'; roundRect(ctx,148,22,isOwner?440:280,30,6); ctx.fill();
-  ctx.font='bold 11px monospace'; ctx.fillStyle=hex; ctx.textAlign='left'; ctx.fillText(tierLabel,160,42);
+  // ── Tier badge (top-left area) ─────────────────────────────────────────────
+  const tierLabel = isOwner
+    ? '◈  ABSOLUTE AUTHORITY  ◈'
+    : `TIER ${title.tier}  ·  ${(TIER_NAMES[title.tier]??'').toUpperCase()}  ·  RANK #${title.rank}/50`;
+  const badgeW = isOwner ? 280 : 330;
+  ctx.fillStyle=hex+'20'; roundRect(ctx,150,18,badgeW,26,6); ctx.fill();
+  ctx.strokeStyle=hex+'40'; ctx.lineWidth=1; ctx.stroke();
+  ctx.font='bold 10px monospace'; ctx.fillStyle=hex; ctx.textAlign='left';
+  ctx.fillText(tierLabel,162,36);
 
-  ctx.font='bold 30px sans-serif'; ctx.fillStyle='#FFF'; ctx.shadowColor='rgba(0,0,0,.8)'; ctx.shadowBlur=6;
-  ctx.fillText(user.username.slice(0,22),148,90); ctx.shadowBlur=0;
+  // ── Username ───────────────────────────────────────────────────────────────
+  ctx.font='bold 28px sans-serif'; ctx.fillStyle='#FFFFFF';
+  ctx.shadowColor='rgba(0,0,0,.9)'; ctx.shadowBlur=8;
+  ctx.fillText(user.username.slice(0,22),150,82); ctx.shadowBlur=0;
 
-  ctx.font='bold 18px sans-serif'; ctx.fillStyle=hex;
-  if(isOwner){ctx.shadowColor=hex; ctx.shadowBlur=16;}
-  // FIX: forCanvas() strips variation selectors so title names with emoji render
-  ctx.fillText(forCanvas(title.name),148,120); ctx.shadowBlur=0;
+  // ── Title name ────────────────────────────────────────────────────────────
+  ctx.font='bold 16px sans-serif'; ctx.fillStyle=hex;
+  if(isOwner){ctx.shadowColor=hex; ctx.shadowBlur=18;}
+  ctx.fillText(forCanvas(title.name),150,108); ctx.shadowBlur=0;
 
-  ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.4)'; ctx.fillText('* SNOW POINTS',148,152);
-  ctx.font='bold 34px sans-serif'; ctx.fillStyle=isOwner?'#AA44FF':'#4FC3F7';
-  ctx.shadowColor=isOwner?'#AA44FF':'#4FC3F7'; ctx.shadowBlur=10; ctx.fillText(fmtNum(sd.points),148,192); ctx.shadowBlur=0;
+  // ── Divider line ──────────────────────────────────────────────────────────
+  ctx.strokeStyle='rgba(255,255,255,0.07)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(150,120); ctx.lineTo(W-30,120); ctx.stroke();
 
-  const BX=148,BY=216,BW=660,BH=14;
+  // ── Stat pills row ────────────────────────────────────────────────────────
+  const pillY=130, pillH=36, pillGap=10;
+  const pillW=Math.floor((W-150-30-pillGap*2)/3);
+  drawStatPill(ctx,150,pillY,pillW,'❄️ Snow Points',fmtNum(sd.points),hex);
+  drawStatPill(ctx,150+pillW+pillGap,pillY,pillW,'🎯 Sessions',fmtNum(sd.sessions),hex);
+  drawStatPill(ctx,150+pillW*2+pillGap*2,pillY,pillW,'⏱️ Total AFK Time',fmtDuration(sd.total_seconds),hex);
+
+  // ── Progress section ──────────────────────────────────────────────────────
+  const BX=150, BY=188, BW=W-BX-30, BH=16;
   const prog=isOwner?1:next?Math.min(1,(sd.points-title.min)/(next.min-title.min)):1;
+
+  // Progress label row above bar
+  ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(255,255,255,0.50)'; ctx.textAlign='left';
+  ctx.fillText('PROGRESS',BX,BY-8);
+  const progPct = isOwner ? '100%' : `${Math.round(prog*100)}%`;
+  ctx.textAlign='right'; ctx.fillStyle=hex+'CC'; ctx.fillText(progPct,BX+BW,BY-8);
+
   drawProgressBar(ctx,BX,BY,BW,BH,prog,hex,nHex);
-  ctx.font='11px monospace'; ctx.fillStyle='rgba(255,255,255,.35)';
-  ctx.textAlign='left'; ctx.fillText(forCanvas(title.name),BX,BY+BH+16);
-  ctx.textAlign='right'; ctx.fillText(isOwner?'<>  Absolute Rank  <>':next?`${forCanvas(next.name)}  (${fmtNum(next.min-sd.points)} pts)`:'Max Rank',BX+BW,BY+BH+16);
-  ctx.textAlign='left'; ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.22)';
-  ctx.fillText(`Sessions: ${fmtNum(sd.sessions)}   Total AFK: ${fmtDuration(sd.total_seconds)}`,BX,H-12);
-  ctx.textAlign='right'; ctx.font='bold 13px monospace'; ctx.fillStyle=isOwner?'rgba(170,68,255,.4)':'rgba(79,195,247,.25)';
-  ctx.fillText(isOwner?'<> GLACIAN':'* GLACIAN',W-90,H-12);
+
+  // Progress labels below bar
+  ctx.font='11px monospace'; ctx.fillStyle='rgba(255,255,255,.35)'; ctx.textAlign='left';
+  ctx.fillText(forCanvas(title.name),BX,BY+BH+14);
+  ctx.textAlign='right';
+  ctx.fillText(
+    isOwner ? '◈  Absolute Rank  ◈' : next ? `${forCanvas(next.name)}  (${fmtNum(next.min-sd.points)} pts)` : '👑 Max Rank',
+    BX+BW, BY+BH+14,
+  );
+
+  // ── Bottom watermark + chibi ──────────────────────────────────────────────
+  drawChibiGlacian(ctx,W-56,H-56,.65,hex);
+  ctx.font='bold 11px monospace'; ctx.fillStyle=isOwner?'rgba(170,68,255,.30)':'rgba(79,195,247,.20)';
+  ctx.textAlign='right';
+  ctx.fillText(isOwner?'◈ GLACIAN':'❄️ GLACIAN',W-90,H-12);
+
+  // Bottom gradient line
+  const bl=ctx.createLinearGradient(0,0,W,0);
+  bl.addColorStop(0,'rgba(0,0,0,0)'); bl.addColorStop(.5,hex+'88'); bl.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=bl; ctx.fillRect(0,H-3,W,3);
+
   return canvas.toBuffer('image/png');
 }
 
-// ─── CANVAS 2: AFK CARD — CENTERED AVATAR + REASON ───────────────────────────
+// ─── CANVAS 2: AFK CARD (redesigned — more organized) ─────────────────────────
 async function generateAfkCard(user, reason, sd) {
-  const W=900,H=380; const canvas=createCanvas(W,H); const ctx=canvas.getContext('2d');
+  const W=940, H=400;
+  const canvas=createCanvas(W,H); const ctx=canvas.getContext('2d');
   const isOwner=user.id===OWNER_ID;
   const title=getTitle(sd.points,user.id);
   const hex=isOwner?hexColor(OWNER_TITLE.color):hexColor(title.color);
 
   drawBgForTitle(ctx,W,H,title);
-  for(const [gy,alpha] of [[0,'44'],[H-2,'FF']]){
-    const g=ctx.createLinearGradient(0,0,W,0); g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(.5,hex+alpha); g.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=g; ctx.fillRect(0,gy,W,2);
+
+  // Top + bottom accent lines
+  for(const [gy,alpha] of [[0,'CC'],[H-3,'88']]){
+    const g=ctx.createLinearGradient(0,0,W,0);
+    g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(.5,hex+alpha); g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=g; ctx.fillRect(0,gy,W,3);
   }
+
   const CX=W/2;
-  ctx.fillStyle=hex+'33'; roundRect(ctx,CX-60,14,120,28,7); ctx.fill();
-  ctx.font='bold 12px monospace'; ctx.fillStyle=hex; ctx.textAlign='center';
-  // FIX: no variation selector on snowflake
-  ctx.fillText('*  AFK ACTIVATED  *',CX,33);
 
+  // ── Status badge ──────────────────────────────────────────────────────────
+  ctx.fillStyle=hex+'28'; roundRect(ctx,CX-80,14,160,28,8); ctx.fill();
+  ctx.strokeStyle=hex+'55'; ctx.lineWidth=1; ctx.stroke();
+  ctx.font='bold 11px monospace'; ctx.fillStyle=hex; ctx.textAlign='center';
+  ctx.fillText('❄️  AFK ACTIVATED  ❄️',CX,33);
+
+  // ── Avatar (centered) ─────────────────────────────────────────────────────
   const img=await fetchAvatar(user);
-  drawAvatar(ctx,img,CX,100,58,hex);
+  drawAvatar(ctx,img,CX,104,60,hex);
 
-  ctx.font='bold 24px sans-serif'; ctx.fillStyle='#FFF'; ctx.textAlign='center';
-  ctx.shadowColor='rgba(0,0,0,.8)'; ctx.shadowBlur=5; ctx.fillText(user.username.slice(0,24),CX,176); ctx.shadowBlur=0;
-  ctx.font='bold 14px sans-serif'; ctx.fillStyle=hex; ctx.shadowColor=hex; ctx.shadowBlur=8;
-  ctx.fillText(forCanvas(title.name),CX,198); ctx.shadowBlur=0;
+  // ── Username ──────────────────────────────────────────────────────────────
+  ctx.font='bold 26px sans-serif'; ctx.fillStyle='#FFF'; ctx.textAlign='center';
+  ctx.shadowColor='rgba(0,0,0,.9)'; ctx.shadowBlur=6;
+  ctx.fillText(user.username.slice(0,24),CX,183); ctx.shadowBlur=0;
 
-  ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(CX-200,210); ctx.lineTo(CX+200,210); ctx.stroke();
-  ctx.font='bold 10px monospace'; ctx.fillStyle='rgba(255,255,255,.35)'; ctx.fillText('REASON',CX,226);
+  // ── Title ─────────────────────────────────────────────────────────────────
+  ctx.font='bold 14px sans-serif'; ctx.fillStyle=hex;
+  ctx.shadowColor=hex; ctx.shadowBlur=10;
+  ctx.fillText(forCanvas(title.name),CX,204); ctx.shadowBlur=0;
 
+  // ── Tier badge ────────────────────────────────────────────────────────────
+  if (!isOwner) {
+    const tb = `Tier ${title.tier}  ·  Rank #${title.rank}/50`;
+    ctx.font='10px monospace'; ctx.fillStyle='rgba(255,255,255,.30)';
+    ctx.fillText(tb,CX,220);
+  }
+
+  // ── Divider ───────────────────────────────────────────────────────────────
+  ctx.strokeStyle='rgba(255,255,255,.10)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(CX-220,234); ctx.lineTo(CX+220,234); ctx.stroke();
+
+  // ── REASON label ──────────────────────────────────────────────────────────
+  ctx.font='bold 10px monospace'; ctx.fillStyle='rgba(255,255,255,.35)';
+  ctx.fillText('REASON',CX,250);
+
+  // ── Reason text (word-wrapped) ────────────────────────────────────────────
   const clean=reason.length>400?reason.slice(0,397)+'...':reason;
-  const lines=wrapLines(ctx,clean,680); const lineH=28; const maxL=4; let lineY=250;
-  ctx.font='bold 20px sans-serif'; ctx.fillStyle='#FFF'; ctx.shadowColor='rgba(0,0,0,.6)'; ctx.shadowBlur=4;
+  const lines=wrapLines(ctx,clean,680); const lineH=26; const maxL=4; let lineY=272;
+  ctx.font='bold 18px sans-serif'; ctx.fillStyle='#FFF';
+  ctx.shadowColor='rgba(0,0,0,.7)'; ctx.shadowBlur=4;
   for(let i=0;i<Math.min(lines.length,maxL);i++){
     let txt=lines[i]; if(i===maxL-1&&lines.length>maxL)txt+='...';
     ctx.fillText(txt,CX,lineY); lineY+=lineH;
   }
   ctx.shadowBlur=0;
-  const sepY=Math.max(lineY+6,326);
-  ctx.strokeStyle='rgba(255,255,255,.07)'; ctx.beginPath(); ctx.moveTo(120,sepY); ctx.lineTo(W-120,sepY); ctx.stroke();
-  ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.30)';
-  ctx.fillText(`*  ${fmtNum(sd.points)} snow pts  -  Session #${fmtNum(sd.sessions+1)}  -  ${forCanvas(title.name)}`,CX,sepY+18);
+
+  // ── Bottom stat strip ─────────────────────────────────────────────────────
+  const stripY=Math.max(lineY+10,340);
+  ctx.fillStyle='rgba(255,255,255,0.04)';
+  roundRect(ctx,CX-300,stripY,600,34,8); ctx.fill();
+  ctx.strokeStyle=hex+'22'; ctx.lineWidth=1; ctx.stroke();
+  ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.35)'; ctx.textAlign='center';
+  ctx.fillText(
+    `❄️  ${fmtNum(sd.points)} snow pts  ·  Session #${fmtNum(sd.sessions+1)}  ·  ${forCanvas(title.name)}`,
+    CX, stripY+21,
+  );
+
+  // ── Chibi + watermark ─────────────────────────────────────────────────────
   drawChibiGlacian(ctx,W-55,H/2+10,.75,hex);
-  ctx.font='bold 12px monospace'; ctx.fillStyle=isOwner?'rgba(170,68,255,.30)':'rgba(79,195,247,.20)';
-  ctx.fillText(isOwner?'<> GLACIAN':'* GLACIAN',CX,H-10);
+  ctx.font='bold 11px monospace'; ctx.fillStyle=isOwner?'rgba(170,68,255,.25)':'rgba(79,195,247,.18)';
+  ctx.fillText(isOwner?'◈ GLACIAN':'❄️ GLACIAN',CX,H-8);
+
   return canvas.toBuffer('image/png');
 }
 
-// ─── CANVAS 3: TITLE REVEAL CARD ─────────────────────────────────────────────
+// ─── CANVAS 3: TITLE REVEAL CARD (redesigned — more organized) ────────────────
 async function generateTitleRevealCard(user, sd) {
-  const W=900,H=420; const canvas=createCanvas(W,H); const ctx=canvas.getContext('2d');
+  const W=940, H=460;
+  const canvas=createCanvas(W,H); const ctx=canvas.getContext('2d');
   const isOwner=user.id===OWNER_ID;
   const title=getTitle(sd.points,user.id), next=getNext(sd.points,user.id);
   const hex=isOwner?hexColor(OWNER_TITLE.color):hexColor(title.color);
   const nHex=next?hexColor(next.color):hex;
 
   drawBgForTitle(ctx,W,H,title);
-  const cG=ctx.createRadialGradient(W/2,H/2,20,W/2,H/2,300);
-  cG.addColorStop(0,hex+'22'); cG.addColorStop(1,'rgba(0,0,0,0)'); ctx.fillStyle=cG; ctx.fillRect(0,0,W,H);
-  for(const [gy,alpha] of [[0,'55'],[H-2,'FF']]){
-    const g=ctx.createLinearGradient(0,0,W,0); g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(.5,hex+alpha); g.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=g; ctx.fillRect(0,gy,W,2);
+
+  // Radial center glow
+  const cG=ctx.createRadialGradient(W/2,H/2,20,W/2,H/2,320);
+  cG.addColorStop(0,hex+'1A'); cG.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=cG; ctx.fillRect(0,0,W,H);
+
+  // Top + bottom accent lines
+  for(const [gy,alpha] of [[0,'BB'],[H-3,'77']]){
+    const g=ctx.createLinearGradient(0,0,W,0);
+    g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(.5,hex+alpha); g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=g; ctx.fillRect(0,gy,W,3);
   }
-  const img=await fetchAvatar(user); drawAvatar(ctx,img,W/2,88,60,hex);
-  drawChibiGlacian(ctx,W/2+130,88,.8,hex);
+
+  // ── Avatar + chibi (centered) ─────────────────────────────────────────────
+  const img=await fetchAvatar(user);
+  drawAvatar(ctx,img,W/2,90,62,hex);
+  drawChibiGlacian(ctx,W/2+148,86,.82,hex);
 
   if (isOwner) {
-    ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(138,43,226,.6)'; ctx.textAlign='center';
-    ctx.fillText('[ SYSTEM — STATUS NOTIFICATION ]',W/2,166);
-    ctx.save(); ctx.shadowColor='#AA44FF'; ctx.shadowBlur=40; ctx.font='48px sans-serif'; ctx.fillStyle='#AA44FF'; ctx.fillText('<>',W/2,210); ctx.restore();
-    ctx.font='bold 38px sans-serif'; ctx.fillStyle='#CC66FF'; ctx.shadowColor='#8800CC'; ctx.shadowBlur=30;
-    ctx.fillText('MONARCA DE LAS SOMBRAS',W/2,258); ctx.shadowBlur=0;
-    ctx.font='bold 15px sans-serif'; ctx.fillStyle='rgba(100,120,255,.75)'; ctx.fillText('HAS EMERGED FROM THE ETERNAL ABYSS',W/2,284);
+    // ── OWNER special layout ────────────────────────────────────────────────
+    ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(138,43,226,.65)'; ctx.textAlign='center';
+    ctx.fillText('[ SYSTEM  ·  STATUS NOTIFICATION ]',W/2,174);
+
+    // Crown icon (emoji)
+    ctx.save(); ctx.shadowColor='#AA44FF'; ctx.shadowBlur=40;
+    ctx.font='40px NotoColorEmoji, sans-serif'; ctx.fillStyle='#AA44FF';
+    ctx.fillText('👑',W/2,218); ctx.restore();
+
+    // FIX: Title is now in English ("MONARCH OF SHADOWS")
+    ctx.font='bold 36px sans-serif'; ctx.fillStyle='#CC66FF';
+    ctx.shadowColor='#8800CC'; ctx.shadowBlur=30;
+    ctx.fillText('MONARCH OF SHADOWS',W/2,262); ctx.shadowBlur=0;
+
+    ctx.font='bold 14px sans-serif'; ctx.fillStyle='rgba(100,120,255,.80)';
+    ctx.fillText('HAS EMERGED FROM THE ETERNAL ABYSS',W/2,287);
+
     ctx.strokeStyle='rgba(106,13,173,.4)'; ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(160,306);ctx.lineTo(W-160,306);ctx.stroke();
-    ctx.font='13px monospace'; ctx.fillStyle='rgba(170,100,255,.55)';
-    ctx.fillText(`<>  Absolute Authority  -  ${fmtNum(sd.points)} snow pts  -  Sessions: ${fmtNum(sd.sessions)}`,W/2,332);
-    ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(106,13,173,.3)'; ctx.fillText('[ END OF NOTIFICATION ]',W/2,356);
-    ctx.font='bold 12px monospace'; ctx.fillStyle='rgba(170,68,255,.2)'; ctx.fillText('<> GLACIAN',W/2,H-14);
+
+    // Stat row
+    ctx.fillStyle='rgba(170,68,255,.08)';
+    roundRect(ctx,W/2-240,314,480,34,8); ctx.fill();
+    ctx.font='12px monospace'; ctx.fillStyle='rgba(170,100,255,.60)'; ctx.textAlign='center';
+    ctx.fillText(
+      `◈  Absolute Authority  ·  ${fmtNum(sd.points)} snow pts  ·  Sessions: ${fmtNum(sd.sessions)}`,
+      W/2, 336,
+    );
+
+    ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(106,13,173,.35)';
+    ctx.fillText('[ END OF NOTIFICATION ]',W/2,370);
+
+    ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(170,68,255,.20)';
+    ctx.fillText('◈ GLACIAN',W/2,H-14);
     return canvas.toBuffer('image/png');
   }
 
-  ctx.font='bold 12px monospace'; ctx.fillStyle=hex+'AA'; ctx.textAlign='center';
-  ctx.fillText(`TIER ${title.tier}  -  ${TIER_NAMES[title.tier]?.toUpperCase()??''}`,W/2,172);
-  const fs=title.name.length>22?30:38;
-  ctx.font=`bold ${fs}px sans-serif`; ctx.fillStyle=hex; ctx.shadowColor=hex; ctx.shadowBlur=22;
-  ctx.fillText(forCanvas(title.name),W/2,220); ctx.shadowBlur=0;
-  ctx.fillStyle=hex+'22'; roundRect(ctx,W/2-100,232,200,28,8); ctx.fill();
-  ctx.font='bold 12px monospace'; ctx.fillStyle=hex; ctx.fillText(`RANK #${title.rank} / 50`,W/2,251);
-  ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(120,276);ctx.lineTo(W-120,276);ctx.stroke();
-  // Flavor text (always English)
-  const flavor=TITLE_FLAVOR[title.rank]??'';
-  ctx.font='italic 13px sans-serif'; ctx.fillStyle=hex+'BB'; ctx.fillText(`"${flavor}"`,W/2,294);
+  // ── Normal title reveal ───────────────────────────────────────────────────
+  const tierPill=`TIER ${title.tier}  ·  ${(TIER_NAMES[title.tier]??'').toUpperCase()}`;
+  ctx.font='bold 11px monospace'; ctx.fillStyle=hex+'CC'; ctx.textAlign='center';
+  ctx.fillText(tierPill,W/2,178);
 
-  const BX=120,BW=W-240,BH=10,BY=312;
+  // Title name (large, glowing)
+  const fs=title.name.length>22?30:38;
+  ctx.font=`bold ${fs}px NotoColorEmoji, sans-serif`; ctx.fillStyle=hex;
+  ctx.shadowColor=hex; ctx.shadowBlur=24;
+  ctx.fillText(forCanvas(title.name),W/2,226); ctx.shadowBlur=0;
+
+  // Rank badge
+  ctx.fillStyle=hex+'22'; roundRect(ctx,W/2-110,236,220,30,8); ctx.fill();
+  ctx.strokeStyle=hex+'55'; ctx.lineWidth=1; ctx.stroke();
+  ctx.font='bold 12px monospace'; ctx.fillStyle=hex;
+  ctx.fillText(`RANK  #${title.rank}  /  50`,W/2,256);
+
+  // Flavor text (always English — ice world lore)
+  ctx.strokeStyle='rgba(255,255,255,.07)'; ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(120,274);ctx.lineTo(W-120,274);ctx.stroke();
+  const flavor=TITLE_FLAVOR[title.rank]??'';
+  ctx.font='italic 13px sans-serif'; ctx.fillStyle=hex+'BB';
+  ctx.fillText(`"${flavor}"`,W/2,294);
+
+  // ── Progress bar section ──────────────────────────────────────────────────
+  const BX=120, BW=W-240, BH=14, BY=318;
   const prog=next?Math.min(1,(sd.points-title.min)/(next.min-title.min)):1;
+
+  // Progress header
+  ctx.font='bold 10px monospace'; ctx.fillStyle='rgba(255,255,255,.40)'; ctx.textAlign='left';
+  ctx.fillText('PROGRESS',BX,BY-6);
+  ctx.textAlign='right'; ctx.fillStyle=hex+'AA';
+  ctx.fillText(`${Math.round(prog*100)}%`,BX+BW,BY-6);
+
   drawProgressBar(ctx,BX,BY,BW,BH,prog,hex,nHex);
-  ctx.font='11px monospace'; ctx.fillStyle='rgba(255,255,255,.3)';
-  ctx.textAlign='left'; ctx.fillText(forCanvas(title.name),BX,BY+BH+14);
-  ctx.textAlign='right'; ctx.fillText(next?`${forCanvas(next.name)} (${fmtNum(next.min-sd.points)} pts)`:'Max Rank',BX+BW,BY+BH+14);
-  ctx.textAlign='center'; ctx.font='13px monospace'; ctx.fillStyle='rgba(255,255,255,.25)';
-  ctx.fillText(`*  ${fmtNum(sd.points)} snow pts  -  Sessions: ${fmtNum(sd.sessions)}`,W/2,H-28);
-  ctx.font='bold 12px monospace'; ctx.fillStyle='rgba(79,195,247,.2)'; ctx.fillText('* GLACIAN',W/2,H-12);
+
+  // Progress labels below bar
+  ctx.font='11px monospace'; ctx.fillStyle='rgba(255,255,255,.30)'; ctx.textAlign='left';
+  ctx.fillText(forCanvas(title.name),BX,BY+BH+14);
+  ctx.textAlign='right';
+  ctx.fillText(
+    next ? `${forCanvas(next.name)}  (${fmtNum(next.min-sd.points)} pts)` : '👑 Max Rank',
+    BX+BW, BY+BH+14,
+  );
+
+  // ── Bottom stat strip ─────────────────────────────────────────────────────
+  const sY=BY+BH+36;
+  ctx.fillStyle='rgba(255,255,255,0.04)';
+  roundRect(ctx,BX,sY,BW,30,6); ctx.fill();
+  ctx.strokeStyle=hex+'22'; ctx.lineWidth=1; ctx.stroke();
+  ctx.font='12px monospace'; ctx.fillStyle='rgba(255,255,255,.28)'; ctx.textAlign='center';
+  ctx.fillText(
+    `❄️  ${fmtNum(sd.points)} snow pts  ·  Sessions: ${fmtNum(sd.sessions)}`,
+    W/2, sY+20,
+  );
+
+  ctx.font='bold 11px monospace'; ctx.fillStyle='rgba(79,195,247,.20)';
+  ctx.fillText('❄️ GLACIAN',W/2,H-10);
   return canvas.toBuffer('image/png');
 }
 
 // ─── DISCORD COMPONENTS V2 BUILDERS ──────────────────────────────────────────
-// FIX: All accessory thumbnails now use attachment://avatar.png for guaranteed
-// rendering. CDN URLs sometimes fail in Components V2; attachment:// always works.
-
 function buildAfkSet(user, reason, startedAt, expiresAt, snow, title, aiMsg, lang) {
   const ts=Math.floor(startedAt/1000);
   const isOwner=user.id===OWNER_ID;
@@ -710,7 +867,6 @@ function buildAfkSet(user, reason, startedAt, expiresAt, snow, title, aiMsg, lan
     components: [{
       type:17, accent_color: isOwner?OWNER_TITLE.color:title.color,
       components: [
-        // FIX: Use attachment://avatar.png instead of CDN URL for reliable display
         { type:9, components:[{type:10,content:body}], accessory:{type:11,media:{url:'attachment://avatar.png'}} },
         { type:14, divider:true, spacing:1 },
         { type:10, content:foot },
@@ -727,8 +883,6 @@ function buildAfkMention(afkUser, afkData, currentMentions, lang) {
   const ts=Math.floor(afkData.started_at/1000);
   const elapsed=Math.floor((Date.now()-afkData.started_at)/1000);
   const isOwner=afkUser.id===OWNER_ID;
-  // FIX: Simplified mention — only shows "is AFK" as requested
-  // No buttons, no extra sections — clean and fast
   const body=[
     `## ${isOwner?'◈':'🌨️'}  **${afkUser.username}** is AFK`,
     ``,
@@ -741,7 +895,6 @@ function buildAfkMention(afkUser, afkData, currentMentions, lang) {
     components:[{
       type:17, accent_color:isOwner?OWNER_TITLE.color:0x4FC3F7,
       components:[
-        // FIX: Use attachment://avatar.png for reliable profile picture
         {type:9,components:[{type:10,content:body}],accessory:{type:11,media:{url:'attachment://avatar.png'}}},
         {type:14,divider:true,spacing:1},
         {type:10,content:`-# Glacian notifies when **${afkUser.username}** returns ❄️`},
@@ -779,7 +932,6 @@ function buildAfkReturn(user, durationSec, mentions, sd, aiMsg, lang) {
     components:[{
       type:17,accent_color:isOwner?OWNER_TITLE.color:title.color,
       components:[
-        // FIX: Use attachment://avatar.png for reliable profile picture
         {type:9,components:[{type:10,content:body}],accessory:{type:11,media:{url:'attachment://avatar.png'}}},
         {type:14,divider:true,spacing:1},
         {type:10,content:foot},
@@ -896,8 +1048,6 @@ async function sendV2(channelId, payload, replyToId=null) {
   return rest.post(Routes.channelMessages(channelId),{body});
 }
 
-// FIX: Multi-file send — uploads avatar + optional card image as attachments.
-// This ensures attachment://avatar.png is always valid in the Components V2 payload.
 async function sendV2WithAvatar(channelId, payload, avatarBuf, cardBuf, cardName, replyToId=null) {
   const body={...payload};
   if(replyToId){body.message_reference={message_id:replyToId};body.allowed_mentions={parse:[],replied_user:false};}
@@ -918,7 +1068,6 @@ async function sendV2File(channelId, payload, buf, name, replyToId=null) {
   return rest.post(Routes.channelMessages(channelId),{body:form,passThroughBody:true});
 }
 
-// FIX: Edit helpers — used in handleReturn to EDIT instead of delete+resend
 async function editV2(channelId, messageId, payload) {
   return rest.patch(Routes.channelMessage(channelId,messageId),{body:payload}).catch(()=>{});
 }
@@ -945,7 +1094,6 @@ async function slashPatchFile(interaction,payload,buf,name) {
   return rest.patch(Routes.webhookMessage(interaction.applicationId,interaction.token,'@original'),{body:form,passThroughBody:true});
 }
 
-// FIX: Slash reply with avatar + card files for reliable Components V2 thumbnails
 async function slashPatchWithAvatar(interaction,payload,avatarBuf,cardBuf,cardName) {
   const form=new FormData();
   form.append('payload_json',JSON.stringify(payload));
@@ -1013,7 +1161,6 @@ async function sendAfkEndDM(discordUser, durationSec, lang, sd, cardBuf) {
     };
     await sendV2(dm.id,mentPayload).catch(()=>{});
   } catch(e){
-    // DMs closed — silently fail
     console.error('[DM] Could not send to',discordUser.id,':',e.message);
   }
 }
@@ -1033,16 +1180,13 @@ async function handleTimerExpiry(userId) {
   const title=getTitle(sd.points,userId);
   const isOwner=userId===OWNER_ID;
 
-  // FIX: Fetch user ONCE and reuse — avoid race condition / empty URL bug
   const discordUser=await client.users.fetch(userId).catch(()=>null);
   const avatarUrl=discordUser?.displayAvatarURL({extension:'png',size:256,forceStatic:true})||'';
 
-  // Generate title card using the real user object when possible
   let cardBuf=null;
   const fakeUser={id:userId,username:discordUser?.username||'User',displayAvatarURL:()=>avatarUrl};
   try{cardBuf=await generateTitleRevealCard(fakeUser,sd);}catch(e){console.error('[Canvas timer]',e.message);}
 
-  // Send DM with timer expired notification
   try{
     if(!discordUser)throw new Error('User not found');
     const dm=await discordUser.createDM();
@@ -1072,7 +1216,6 @@ async function handleTimerExpiry(userId) {
     await sendV2(dm.id,timerPayload).catch(()=>{});
     await sendAfkEndDM(discordUser,durationSec,lang,sd,cardBuf);
 
-    // Also notify in original channel if possible
     if(afkData.notify_channel){
       const flavor=isOwner?OWNER_FLAVOR:(TITLE_FLAVOR[title.rank]??'');
       const channelPayload={
@@ -1080,7 +1223,6 @@ async function handleTimerExpiry(userId) {
         components:[{
           type:17,accent_color:isOwner?OWNER_TITLE.color:title.color,
           components:[
-            // FIX: Use attachment://avatar.png — pre-fetched user avoids empty URL bug
             {type:9,components:[{type:10,content:[
               `## ⏱️  ${isOwner?'◈':'❄️'}  AFK Timer Expired — <@${userId}>`,
               ``,
@@ -1094,7 +1236,6 @@ async function handleTimerExpiry(userId) {
           ],
         }],
       };
-      // FIX: Upload avatar as attachment so thumbnail renders correctly
       const avatarBuf=await fetchAvatarBuf(discordUser).catch(()=>null);
       if(avatarBuf){
         await sendV2WithAvatar(afkData.notify_channel,channelPayload,avatarBuf,null,null).catch(()=>{});
@@ -1140,7 +1281,6 @@ async function cmdAfk({userId,guildId,guildName,reason,durationMs,user,channelId
   const expiresAt=durationMs?now+durationMs:null;
   await DB.afkSet(userId,reason,now,expiresAt,channelId,guildName||'Unknown');
 
-  // Set timer if duration given
   if(expiresAt){
     setTimeout(()=>handleTimerExpiry(userId),durationMs);
   }
@@ -1149,7 +1289,6 @@ async function cmdAfk({userId,guildId,guildName,reason,durationMs,user,channelId
   const title=getTitle(sd.points,userId);
   const isOwner=userId===OWNER_ID;
 
-  // FIX: Fetch avatar as buffer so attachment://avatar.png works in thumbnail
   const [aiMsg,cardBuf,avatarBuf]=await Promise.all([
     aiAfkMessage(user.username,reason,isOwner),
     generateAfkCard(user,reason,sd).catch(()=>null),
@@ -1158,7 +1297,6 @@ async function cmdAfk({userId,guildId,guildName,reason,durationMs,user,channelId
 
   const payload=buildAfkSet(user,reason,now,expiresAt,sd,title,aiMsg,lang);
 
-  // Inject the canvas card image into the components
   const inject=(name)=>{
     payload.components[0].components.splice(1,0,{type:12,items:[{media:{url:`attachment://${name}`},description:`AFK: ${user.username}`}]});
   };
@@ -1170,7 +1308,6 @@ async function cmdAfk({userId,guildId,guildName,reason,durationMs,user,channelId
       await slashPatchWithAvatar(interaction,payload,avatarBuf,cardBuf,'afk-card.png')
         .catch(async()=>slashPatch(interaction,{content:`❄️ AFK — *${reason}*`}).catch(()=>{}));
     } else {
-      // No card but still send avatar for thumbnail
       if(avatarBuf){
         const form=new FormData();
         form.append('payload_json',JSON.stringify(payload));
@@ -1249,7 +1386,6 @@ async function handleReturn(message) {
   await DB.afkDel(userId);
   const sd=await snowGet(userId);
 
-  // FIX: Fetch avatar buffer so attachment:// thumbnail works in return card
   const [aiMsg,cardBuf,avatarBuf]=await Promise.all([
     aiReturnMessage(message.author.username,fmtDuration(durationSec),mentions,isOwner),
     generateTitleRevealCard(message.author,sd).catch(()=>null),
@@ -1268,20 +1404,16 @@ async function handleReturn(message) {
 
   const channelId=message.channel.id;
 
-  // FIX: EDIT the return message instead of deleting it and sending a new one
-  // This keeps the conversation clean — no message deletion, no ghost messages
   setTimeout(async()=>{
     const titlePayload=buildTitleRevealMsg(message.author,sd);
 
     if(returnMsgId){
-      // Edit the existing return message with the title reveal
       if(cardBuf){
         await editV2WithFile(channelId,returnMsgId,titlePayload,cardBuf,'title-reveal.png');
       } else {
         await editV2(channelId,returnMsgId,titlePayload);
       }
     } else {
-      // Fallback: send new message only if original return message wasn't sent
       if(cardBuf){
         await sendV2File(channelId,titlePayload,cardBuf,'title-reveal.png').catch(()=>sendV2(channelId,titlePayload).catch(()=>{}));
       } else {
@@ -1289,7 +1421,6 @@ async function handleReturn(message) {
       }
     }
 
-    // Send DM with mentions + title card
     await sendAfkEndDM(message.author,durationSec,lang,sd,cardBuf);
   }, 10_000);
 
@@ -1325,7 +1456,6 @@ client.once(Events.ClientReady,async c=>{
 
   await initDB();
 
-  // Register slash commands
   try{
     await rest.put(Routes.applicationCommands(c.user.id),{body:SLASH_COMMANDS});
     console.log('✅  Slash commands registered globally.');
@@ -1340,7 +1470,6 @@ client.once(Events.ClientReady,async c=>{
       setTimeout(()=>handleTimerExpiry(row.user_id),remaining);
       recovered++;
     } else {
-      // Timer expired while bot was down — handle immediately
       setImmediate(()=>handleTimerExpiry(row.user_id));
       recovered++;
     }
@@ -1366,7 +1495,6 @@ client.on(Events.MessageCreate,async message=>{
   const lc=content.toLowerCase().trim();
   const botId=client.user?.id;
 
-  // Detect if this is a reply to the bot
   const isReplyToBot=message.reference?.messageId&&(()=>{
     const ref=message.channel.messages?.cache?.get(message.reference.messageId);
     return ref?.author?.id===botId;
@@ -1387,27 +1515,20 @@ client.on(Events.MessageCreate,async message=>{
       if(!afkData)continue;
       await DB.afkMention(mentioned.id);
       const updated=await DB.afkGet(mentioned.id);
-      // Log this mention with context
       await DB.mentionLog(
-        mentioned.id,
-        userId,
-        message.author.username,
-        message.channel.id,
-        message.channel.name||'unknown',
-        message.guild.name||'Unknown',
-        content.slice(0,200)
+        mentioned.id,userId,message.author.username,
+        message.channel.id,message.channel.name||'unknown',
+        message.guild.name||'Unknown',content.slice(0,200)
       );
       try{
         const member=await message.guild.members.fetch(mentioned.id).catch(()=>null);
         const dispUser=member?.user??mentioned;
         const lang=await DB.getLang(mentioned.id);
-        // FIX: Fetch avatar buffer for reliable thumbnail in mention card
         const avatarBuf=await fetchAvatarBuf(dispUser).catch(()=>null);
         const mentionPayload=buildAfkMention(dispUser,afkData,updated?.mentions??1,lang);
         if(avatarBuf){
           await sendV2WithAvatar(message.channel.id,mentionPayload,avatarBuf,null,null,message.id);
         } else {
-          // Fallback: swap to CDN URL if avatar fetch failed
           mentionPayload.components[0].components[0].accessory.media.url=
             dispUser.displayAvatarURL({extension:'png',size:256,forceStatic:true});
           await sendV2(message.channel.id,mentionPayload,message.id);
@@ -1436,7 +1557,6 @@ client.on(Events.MessageCreate,async message=>{
   };
 
   if(cmd==='afk'){
-    // Parse optional duration from last word: "gn afk studying hard 5m"
     const words=args.split(/\s+/);
     const lastWord=words[words.length-1];
     const ms=parseDuration(lastWord);
@@ -1522,4 +1642,17 @@ if(!process.env.DISCORD_TOKEN){
   console.error('❌  DISCORD_TOKEN not set. Add it to your environment variables.');
   process.exit(1);
 }
-client.login(process.env.DISCORD_TOKEN);
+
+// ─── HTTP SERVER — required by Render for port detection ──────────────────────
+// Render's health scanner kills processes that don't bind to any port.
+// This tiny server lets Render know the process is alive.
+const PORT = parseInt(process.env.PORT || '3000', 10);
+createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Glacian ❄️ is online');
+}).listen(PORT, '0.0.0.0', () => {
+  console.log(`✅  HTTP server listening on port ${PORT} (required by Render)`);
+});
+
+// ─── START: load emoji font, then connect to Discord ─────────────────────────
+initEmojiFont().then(() => client.login(process.env.DISCORD_TOKEN));
