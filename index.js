@@ -15,10 +15,14 @@ import {
   SlashCommandBuilder, Events, ActivityType,
 } from 'discord.js';
 import { createCanvas, loadImage, GlobalFonts } from '@napi-rs/canvas';
-import { createServer } from 'http';
 import OpenAI from 'openai';
 import { DB, initDB, snowGet } from './db.js';
 import { t, VALID_LANGS } from './i18n.js';
+import {
+  initAntiReaction, handleReactionAdd, handleAntiReactionInteraction,
+  handleAntiReactionCommand, buildAntiReactionSlash,
+} from './antireaction.js';
+import { startWebServer } from './web.js';
 
 // ─── EMOJI FONT — download Noto Color Emoji so emojis render on Linux ─────────
 async function initEmojiFont() {
@@ -254,53 +258,37 @@ const chatHistory = new Map();
 
 async function aiAfkMessage(username, reason, isOwner) {
   return aiCall([{ role: 'user', content:
-    `You are Glacian, a Discord bot forged in eternal winter. ${isOwner ? "This user is the Monarch of Shadows, the bot's owner. Use an epic, reverent tone." : ''}
-Write ONE short line (max 100 chars) announcing in Spanish that "${username}" went AFK because: "${reason}".
-Use ice/cold metaphors. Be dramatic and creative. ONLY the line, no quotes.` }],
-    { maxTokens: 70, temperature: 1.3 });
+    `Glacian bot. ${isOwner ? 'Owner: epic tone.' : ''}One Spanish line (max 80 chars): "${username}" went AFK: "${reason}". Ice metaphor. No quotes.` }],
+    { maxTokens: 45, temperature: 1.1 });
 }
 
 async function aiReturnMessage(username, duration, mentions, isOwner) {
   return aiCall([{ role: 'user', content:
-    `You are Glacian, a poetic Discord bot. ${isOwner ? 'This is the Monarch of Shadows. His return is an epic event.' : ''}
-Write ONE welcome line (max 90 chars) in Spanish for "${username}" who returned after ${duration} AFK with ${mentions} mention(s).
-Make it epic and warm. ONLY the line, no quotes.` }],
-    { maxTokens: 60, temperature: 1.3 });
+    `Glacian bot. One Spanish welcome line (max 70 chars) for "${username}" returned after ${duration} AFK${mentions ? `, ${mentions} mentions` : ''}. Epic. No quotes.` }],
+    { maxTokens: 35, temperature: 1.1 });
 }
 
 async function aiChatResponse(userId, username, userMessage) {
   if (!chatHistory.has(userId)) chatHistory.set(userId, []);
   const history = chatHistory.get(userId);
   history.push({ role: 'user', content: `${username}: ${userMessage}` });
-  if (history.length > 20) history.splice(0, history.length - 20);
+  if (history.length > 10) history.splice(0, history.length - 10);
 
   const isOwner = userId === OWNER_ID;
-  const sys = `You are Glacian ❄️ — a Discord bot with real personality. You're the coolest friend in the server.
-
-Your personality:
-- Witty, sarcastic with care, funny and authentic
-- Make good jokes, gaming/anime/meme references when they fit naturally
-- Ice/winter aesthetic, but mentioned naturally, not forced
-- You have your own opinions
-- Use emojis when they add something (max 3, not in every sentence)
-- Always reply in Spanish, max 160 words
-- Concise — zero filler words
-- Actually good humor: timing, references, self-irony
-
-IMPORTANT RULES:
-- About your creator and friend: ONLY mention them if the user DIRECTLY asks who created you or who your best friend is. Never bring it up spontaneously.
-- If asked who created you: say you were made by ULTRA (ultra3_dev)
-- If asked about your best friend: say it's <@${BEST_FRIEND}> and mention them with a ping
-- Do NOT use embed format or heavy markdown. Reply as normal chat text.
-${isOwner ? `\n⚜️ This is the Monarch of Shadows — your absolute owner. Treat them specially but keep your personality.` : ''}`;
+  const sys = `Glacian ❄️ — Discord bot, coolest friend in the server.
+Personality: witty, sarcastic with care, funny, ice/winter aesthetic (natural). Your own opinions. Max 3 emojis per reply.
+Rules: Spanish only. Max 80 words. Zero filler. Real humor.
+Creator: ULTRA (ultra3_dev) — mention ONLY if directly asked.
+Best friend: <@${BEST_FRIEND}> — mention ONLY if directly asked.
+Plain text chat replies, no embed markdown.${isOwner ? ` This is the Monarch of Shadows, your owner. Special but keep personality.` : ''}`;
 
   const response = await aiCall(
     [{ role: 'system', content: sys }, ...history],
-    { maxTokens: 280, temperature: 1.1, ms: 5000 },
+    { maxTokens: 160, temperature: 1.0, ms: 4000 },
   );
   if (response) {
     history.push({ role: 'assistant', content: response });
-    if (history.length > 20) history.splice(0, history.length - 20);
+    if (history.length > 10) history.splice(0, history.length - 10);
   }
   return response;
 }
@@ -1359,6 +1347,10 @@ const SLASH_COMMANDS=[
       .addChoices({name:'🇺🇸 English',value:'en'},{name:'🇪🇸 Español',value:'es'},{name:'🇧🇷 Português',value:'pt'})),
 ].map(c=>c.toJSON());
 
+// Anti-reaction is registered as raw JSON (not SlashCommandBuilder) because it
+// uses subcommand groups with complex nested options not easily expressible via builder
+const ANTI_SLASH = buildAntiReactionSlash();
+
 // ─── COMMAND HANDLERS ─────────────────────────────────────────────────────────
 async function cmdAfk({userId,guildId,guildName,reason,durationMs,isGlobal,user,channelId,messageId,isSlash,interaction}) {
   const lang=await DB.getLang(userId);
@@ -1560,20 +1552,27 @@ async function handleAiChat(message, botId) {
 
 // ─── DISCORD CLIENT ───────────────────────────────────────────────────────────
 const client=new Client({
-  intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent,GatewayIntentBits.GuildMembers],
-  partials:[Partials.Message,Partials.Channel],
+  intents:[
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions,
+  ],
+  partials:[Partials.Message,Partials.Channel,Partials.Reaction],
 });
 
 client.once(Events.ClientReady,async c=>{
   console.log(`\n❄️  Glacian online as ${c.user.tag}`);
   console.log(`   Prefix: ${PREFIX}  |  Slash: /`);
-  console.log(`   Commands: afk · snow · titles · lang\n`);
+  console.log(`   Commands: afk · snow · titles · lang · anti reaction\n`);
 
   await initDB();
+  initAntiReaction(process.env.DISCORD_TOKEN, c.user.id);
 
   try{
-    await rest.put(Routes.applicationCommands(c.user.id),{body:SLASH_COMMANDS});
-    console.log('✅  Slash commands registered globally.');
+    await rest.put(Routes.applicationCommands(c.user.id),{body:[...SLASH_COMMANDS, ANTI_SLASH]});
+    console.log('✅  Slash commands registered globally (incl. /anti reaction).');
   }catch(e){console.error('❌  Slash register error:',e.message);}
 
   // Recover timed AFKs after restart
@@ -1713,6 +1712,18 @@ client.on(Events.MessageCreate,async message=>{
 // ─── INTERACTION HANDLER ──────────────────────────────────────────────────────
 client.on(Events.InteractionCreate,async interaction=>{
 
+  // ── Anti-Reaction buttons ──────────────────────────────────────────────────
+  if(interaction.isButton()&&interaction.customId?.startsWith('ar::')){
+    await handleAntiReactionInteraction(interaction,client);
+    return;
+  }
+
+  // ── Anti-Reaction select menus (future-proofing) ──────────────────────────
+  if(interaction.isStringSelectMenu()&&interaction.customId?.startsWith('ar::')){
+    await handleAntiReactionInteraction(interaction,client);
+    return;
+  }
+
   if(interaction.isButton()){
     const [action,targetId]=interaction.customId.split('::');
     if(action==='snow'){
@@ -1738,6 +1749,12 @@ client.on(Events.InteractionCreate,async interaction=>{
   const userId=interaction.user.id;
   const lang=await DB.getLang(userId);
 
+  // ── Anti-Reaction slash command ────────────────────────────────────────────
+  if(interaction.commandName==='anti'){
+    await handleAntiReactionCommand(interaction,client);
+    return;
+  }
+
   const ctx={
     userId,guildId:interaction.guild?.id??'DM',guildName:interaction.guild?.name,
     user:interaction.user,channelId:interaction.channel?.id,
@@ -1749,7 +1766,6 @@ client.on(Events.InteractionCreate,async interaction=>{
     ctx.reason=interaction.options.getString('reason')??'No reason given';
     const timeStr=interaction.options.getString('time');
     ctx.durationMs=timeStr?parseDuration(timeStr):null;
-    // global option: true = all servers, false/null = server only
     ctx.isGlobal=interaction.options.getBoolean('global')??false;
     await cmdAfk(ctx);
   } else if(interaction.commandName==='snow'){
@@ -1765,6 +1781,11 @@ client.on(Events.InteractionCreate,async interaction=>{
   }
 });
 
+// ─── REACTION ADD HANDLER ─────────────────────────────────────────────────────
+client.on(Events.MessageReactionAdd,async(reaction,user)=>{
+  await handleReactionAdd(reaction,user,client);
+});
+
 // ─── ERROR GUARDS ─────────────────────────────────────────────────────────────
 process.on('unhandledRejection',err=>{
   if(err?.code===10062||err?.code===10008)return;
@@ -1772,582 +1793,10 @@ process.on('unhandledRejection',err=>{
 });
 process.on('uncaughtException',err=>console.error('[Exception]',err));
 
-// ─── WEB SERVER ───────────────────────────────────────────────────────────────
-// Serves a full professional landing page + Terms + Privacy Policy
-// This is also required by Render for port detection (keeps the process alive).
 
-const HTML_COMMON_HEAD = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="Glacian — The ultimate AFK bot with snow points, title progression, canvas cards and AI personality.">
-<title>Glacian ❄️ — The Ultimate AFK Bot</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>❄️</text></svg>">
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#06000F;--bg2:#0A0018;--bg3:#0E0022;
-  --p:#8B3DFF;--p2:#6A0DAD;--p3:#AA66FF;
-  --b:#4FC3F7;--b2:#0097A7;
-  --text:#F0E6FF;--muted:rgba(240,230,255,.45);--border:rgba(139,61,255,.18);
-  --card:rgba(12,0,28,.85);--glass:rgba(139,61,255,.08);
-  --rad:14px;--rad-sm:8px;
-}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;line-height:1.6;overflow-x:hidden}
-a{color:var(--p3);text-decoration:none}
-a:hover{color:#FFF}
-
-/* Hex grid bg */
-body::before{
-  content:'';position:fixed;inset:0;z-index:0;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='52'%3E%3Cpolygon points='30,2 58,17 58,47 30,62 2,47 2,17' fill='none' stroke='rgba(139,61,255,0.07)' stroke-width='1'/%3E%3C/svg%3E");
-  background-size:60px 52px;
-  pointer-events:none;
-}
-/* Radial glow */
-body::after{
-  content:'';position:fixed;top:-30%;left:50%;transform:translateX(-50%);
-  width:900px;height:600px;border-radius:50%;
-  background:radial-gradient(ellipse at center,rgba(106,13,173,.18) 0%,transparent 70%);
-  z-index:0;pointer-events:none;
-}
-
-/* Snowfall */
-.snow{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;overflow:hidden}
-.flake{position:absolute;top:-20px;font-size:14px;opacity:.35;animation:fall linear infinite}
-@keyframes fall{to{transform:translateY(110vh) rotate(360deg);opacity:0}}
-
-/* Layout */
-.wrap{max-width:1100px;margin:0 auto;padding:0 24px;position:relative;z-index:1}
-
-/* Nav */
-nav{position:sticky;top:0;z-index:100;backdrop-filter:blur(20px);background:rgba(6,0,15,.82);border-bottom:1px solid var(--border)}
-.nav-inner{display:flex;align-items:center;justify-content:space-between;height:60px}
-.nav-logo{font-size:20px;font-weight:800;letter-spacing:-0.5px;color:#FFF;display:flex;align-items:center;gap:8px}
-.nav-logo span{color:var(--p3)}
-.nav-links{display:flex;align-items:center;gap:28px;font-size:14px;font-weight:500}
-.nav-links a{color:var(--muted);transition:.2s}
-.nav-links a:hover{color:#FFF}
-.nav-cta{background:var(--p);color:#FFF!important;padding:8px 18px;border-radius:20px;font-weight:600;transition:.2s!important}
-.nav-cta:hover{background:var(--p3)!important;transform:translateY(-1px)}
-
-/* Hero */
-.hero{text-align:center;padding:100px 0 80px}
-.hero-eyebrow{display:inline-block;background:var(--glass);border:1px solid var(--border);color:var(--p3);font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:6px 16px;border-radius:20px;margin-bottom:28px}
-.hero h1{font-size:clamp(42px,7vw,80px);font-weight:900;line-height:1.05;letter-spacing:-2px;margin-bottom:20px}
-.hero h1 .grad{background:linear-gradient(135deg,#FFF 0%,var(--p3) 40%,var(--b) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.hero-sub{font-size:18px;color:var(--muted);max-width:560px;margin:0 auto 40px}
-.hero-btns{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
-.btn{padding:13px 28px;border-radius:24px;font-weight:700;font-size:15px;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:8px;border:none}
-.btn-primary{background:linear-gradient(135deg,var(--p),var(--p2));color:#FFF;box-shadow:0 0 30px rgba(139,61,255,.4)}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 0 40px rgba(139,61,255,.6);color:#FFF}
-.btn-secondary{background:var(--glass);border:1px solid var(--border);color:var(--text)}
-.btn-secondary:hover{background:rgba(139,61,255,.15);color:#FFF}
-.hero-badge{display:inline-flex;align-items:center;gap:6px;margin-top:32px;color:var(--muted);font-size:13px}
-.status-dot{width:8px;height:8px;background:#44FF88;border-radius:50%;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-
-/* Section */
-section{padding:80px 0}
-.section-label{font-size:11px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:var(--p3);margin-bottom:12px}
-.section-title{font-size:clamp(28px,4vw,42px);font-weight:800;letter-spacing:-1px;margin-bottom:16px}
-.section-sub{color:var(--muted);font-size:16px;max-width:520px}
-.section-header{margin-bottom:56px}
-.section-header.center{text-align:center}
-.section-header.center .section-sub{margin:0 auto}
-
-/* Cards grid */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--rad);padding:28px;transition:.25s;position:relative;overflow:hidden}
-.card::before{content:'';position:absolute;inset:0;background:var(--glass);opacity:0;transition:.25s}
-.card:hover{transform:translateY(-4px);border-color:var(--p);box-shadow:0 8px 40px rgba(139,61,255,.2)}
-.card:hover::before{opacity:1}
-.card-icon{font-size:32px;margin-bottom:16px}
-.card h3{font-size:18px;font-weight:700;margin-bottom:8px}
-.card p{color:var(--muted);font-size:14px;line-height:1.6}
-.card-accent{position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--p),transparent);opacity:0;transition:.25s}
-.card:hover .card-accent{opacity:1}
-
-/* Commands */
-.commands-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
-.cmd-card{background:var(--card);border:1px solid var(--border);border-radius:var(--rad);padding:22px 24px;display:flex;gap:16px;align-items:flex-start;transition:.2s}
-.cmd-card:hover{border-color:var(--p);background:rgba(12,0,28,.95)}
-.cmd-slug{flex-shrink:0;background:var(--glass);border:1px solid var(--border);color:var(--p3);font-family:monospace;font-size:14px;font-weight:700;padding:8px 14px;border-radius:var(--rad-sm);letter-spacing:-.3px}
-.cmd-body h4{font-size:15px;font-weight:700;margin-bottom:4px}
-.cmd-body p{color:var(--muted);font-size:13px}
-.cmd-badge{display:inline-block;background:rgba(79,195,247,.12);color:var(--b);font-size:10px;font-weight:700;letter-spacing:1px;padding:2px 8px;border-radius:10px;margin-top:6px}
-
-/* Stats bar */
-.stats-bar{background:var(--card);border:1px solid var(--border);border-radius:var(--rad);padding:36px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:24px;text-align:center}
-.stat-item .num{font-size:36px;font-weight:900;background:linear-gradient(135deg,#FFF,var(--p3));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.stat-item .lbl{color:var(--muted);font-size:13px;margin-top:4px}
-
-/* CTA section */
-.cta-box{background:linear-gradient(135deg,rgba(139,61,255,.15),rgba(79,195,247,.08));border:1px solid var(--border);border-radius:20px;padding:60px 40px;text-align:center}
-.cta-box h2{font-size:clamp(26px,4vw,40px);font-weight:800;margin-bottom:12px}
-.cta-box p{color:var(--muted);max-width:480px;margin:0 auto 32px}
-
-/* Divider */
-.divider{border:none;border-top:1px solid var(--border);margin:0}
-
-/* Footer */
-footer{padding:40px 0;border-top:1px solid var(--border)}
-.footer-inner{display:flex;justify-content:space-between;align-items:center;gap:24px;flex-wrap:wrap}
-.footer-logo{font-weight:800;font-size:16px;color:#FFF}
-.footer-links{display:flex;gap:24px;font-size:13px}
-.footer-links a{color:var(--muted)}
-.footer-links a:hover{color:#FFF}
-.footer-copy{color:var(--muted);font-size:12px;width:100%;text-align:center;margin-top:20px}
-
-/* Legal pages */
-.legal-page{max-width:760px;margin:0 auto;padding:60px 24px 80px}
-.legal-page h1{font-size:clamp(28px,5vw,48px);font-weight:800;margin-bottom:8px}
-.legal-page .updated{color:var(--muted);font-size:13px;margin-bottom:48px}
-.legal-page h2{font-size:20px;font-weight:700;margin:36px 0 12px;color:var(--p3)}
-.legal-page p,.legal-page li{color:rgba(240,230,255,.75);font-size:15px;line-height:1.8;margin-bottom:12px}
-.legal-page ul{padding-left:20px}
-.legal-page ul li{margin-bottom:8px}
-.legal-page a{color:var(--p3)}
-.back-link{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;margin-bottom:36px;transition:.2s}
-.back-link:hover{color:#FFF}
-
-/* Responsive */
-@media(max-width:640px){
-  .nav-links{gap:16px;font-size:13px}
-  section{padding:56px 0}
-  .stats-bar{grid-template-columns:1fr 1fr}
-  .footer-inner{flex-direction:column;text-align:center}
-  .footer-links{justify-content:center}
-}
-</style>
-</head>`;
-
-const SNOWFLAKES = Array.from({length:14},(_,i)=>{
-  const chars=['❄','❅','❆','✦','✧'];
-  const c=chars[i%chars.length];
-  const left=Math.random()*100;
-  const dur=8+Math.random()*12;
-  const delay=-Math.random()*14;
-  const size=10+Math.random()*8;
-  return `<span class="flake" style="left:${left.toFixed(1)}%;animation-duration:${dur.toFixed(1)}s;animation-delay:${delay.toFixed(1)}s;font-size:${size}px">${c}</span>`;
-}).join('');
-
-const NAV = `
-<nav>
-  <div class="wrap nav-inner">
-    <a href="/" class="nav-logo">❄️ <span>Glacian</span></a>
-    <div class="nav-links">
-      <a href="/#features">Features</a>
-      <a href="/#commands">Commands</a>
-      <a href="/terms">Terms</a>
-      <a href="/privacy">Privacy</a>
-      <a href="${BOT_INVITE}" class="nav-cta" target="_blank">Add to Discord</a>
-    </div>
-  </div>
-</nav>`;
-
-const FOOTER_HTML = `
-<footer>
-  <div class="wrap">
-    <div class="footer-inner">
-      <span class="footer-logo">❄️ Glacian</span>
-      <div class="footer-links">
-        <a href="/">Home</a>
-        <a href="/#features">Features</a>
-        <a href="/#commands">Commands</a>
-        <a href="/terms">Terms of Service</a>
-        <a href="/privacy">Privacy Policy</a>
-        <a href="${BOT_INVITE}" target="_blank">Invite Bot</a>
-      </div>
-    </div>
-    <div class="footer-copy">
-      © ${new Date().getFullYear()} Glacian Bot — Created by ultra3_dev · Not affiliated with Discord Inc.
-    </div>
-  </div>
-</footer>`;
-
-function buildHomePage() {
-  return `${HTML_COMMON_HEAD}
-<body>
-<div class="snow">${SNOWFLAKES}</div>
-${NAV}
-
-<div class="wrap">
-
-  <!-- HERO -->
-  <section class="hero">
-    <div class="hero-eyebrow">❄️ Discord AFK Bot · v2.1</div>
-    <h1><span class="grad">The Ultimate</span><br>AFK Experience</h1>
-    <p class="hero-sub">Snow points, 50 epic titles, stunning canvas cards, AI personality, and cross-server AFK tracking — all in one bot forged in eternal winter.</p>
-    <div class="hero-btns">
-      <a href="${BOT_INVITE}" class="btn btn-primary" target="_blank">Add to Discord ❄️</a>
-      <a href="/#features" class="btn btn-secondary">Explore Features</a>
-    </div>
-    <div class="hero-badge">
-      <span class="status-dot"></span>
-      Glacian is online and running 24/7
-    </div>
-  </section>
-
-  <hr class="divider">
-
-  <!-- STATS -->
-  <section style="padding:48px 0">
-    <div class="stats-bar">
-      <div class="stat-item"><div class="num">50</div><div class="lbl">Unique Titles</div></div>
-      <div class="stat-item"><div class="num">5</div><div class="lbl">Title Tiers</div></div>
-      <div class="stat-item"><div class="num">3</div><div class="lbl">Languages</div></div>
-      <div class="stat-item"><div class="num">∞</div><div class="lbl">Snow Points</div></div>
-    </div>
-  </section>
-
-  <hr class="divider">
-
-  <!-- FEATURES -->
-  <section id="features">
-    <div class="section-header">
-      <div class="section-label">What makes Glacian special</div>
-      <h2 class="section-title">Built for servers that<br>take AFK seriously</h2>
-      <p class="section-sub">Every minute you're AFK earns you Snow Points, pushing you through a 50-title progression system designed to take years to complete.</p>
-    </div>
-    <div class="cards">
-      <div class="card">
-        <div class="card-icon">❄️</div>
-        <h3>Snow Points System</h3>
-        <p>Every second AFK earns 1 Snow Point. Points accumulate across all your sessions and persist through bot restarts — stored in a cloud database.</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">🏆</div>
-        <h3>50-Title Progression</h3>
-        <p>Five tiers spanning from "Frost Touched" to "Glacian's Chosen" — the max rank requires 5 years of AFK. Each tier unlocks a unique themed background.</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">🎨</div>
-        <h3>Canvas Cards</h3>
-        <p>Beautiful image cards generated on the fly: AFK activation card, Snow Card, Title Reveal, Welcome Back, and Mention notification — all styled to your rank.</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">🌍</div>
-        <h3>Global or Server AFK</h3>
-        <p>Choose between a Global AFK (active in every server the bot is in) or a Server-only AFK that only applies where you set it.</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">🤖</div>
-        <h3>AI Personality</h3>
-        <p>Glacian uses Groq's LLM API to generate unique AFK announcements, welcome-back messages, and chat responses. Mention it or reply to chat!</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">⏱️</div>
-        <h3>Timed AFK</h3>
-        <p>Set a timer on your AFK — Glacian will DM you when the time is up, show your mentions, and post a notification in the original channel.</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">📬</div>
-        <h3>Mention Tracking</h3>
-        <p>Every mention while AFK is logged. When you return, Glacian sends you a DM with a full list of who mentioned you, where, and what they said.</p>
-        <div class="card-accent"></div>
-      </div>
-      <div class="card">
-        <div class="card-icon">🌐</div>
-        <h3>Multi-Language</h3>
-        <p>Full support for English, Spanish, and Portuguese. Set your language once with <code>/lang</code> and all messages adapt to your preference.</p>
-        <div class="card-accent"></div>
-      </div>
-    </div>
-  </section>
-
-  <hr class="divider">
-
-  <!-- COMMANDS -->
-  <section id="commands">
-    <div class="section-header center">
-      <div class="section-label">How to use Glacian</div>
-      <h2 class="section-title">All Commands</h2>
-      <p class="section-sub">Glacian supports both slash commands and a <code>gn</code> prefix. All commands also work as buttons on existing messages.</p>
-    </div>
-    <div class="commands-grid">
-      <div class="cmd-card">
-        <div class="cmd-slug">/afk</div>
-        <div class="cmd-body">
-          <h4>Go AFK</h4>
-          <p>Set yourself as AFK with an optional reason, timer (e.g. <code>5m</code>, <code>2h</code>), and global toggle.</p>
-          <span class="cmd-badge">SLASH + PREFIX</span>
-        </div>
-      </div>
-      <div class="cmd-card">
-        <div class="cmd-slug">/snow</div>
-        <div class="cmd-body">
-          <h4>Snow Card</h4>
-          <p>View your Snow Points, rank, sessions and total AFK time as a beautiful canvas card. Check any user's stats.</p>
-          <span class="cmd-badge">SLASH + PREFIX</span>
-        </div>
-      </div>
-      <div class="cmd-card">
-        <div class="cmd-slug">/titles</div>
-        <div class="cmd-body">
-          <h4>Title List</h4>
-          <p>Browse all 50 titles across 5 tiers with your unlock status and time requirement for each.</p>
-          <span class="cmd-badge">SLASH + PREFIX</span>
-        </div>
-      </div>
-      <div class="cmd-card">
-        <div class="cmd-slug">/lang</div>
-        <div class="cmd-body">
-          <h4>Set Language</h4>
-          <p>Choose your preferred language: English 🇺🇸, Spanish 🇪🇸, or Portuguese 🇧🇷.</p>
-          <span class="cmd-badge">SLASH + PREFIX</span>
-        </div>
-      </div>
-      <div class="cmd-card">
-        <div class="cmd-slug">gn afk</div>
-        <div class="cmd-body">
-          <h4>Prefix AFK</h4>
-          <p>Same as <code>/afk</code> but with the <code>gn</code> prefix. Reason and timer can be added after.</p>
-          <span class="cmd-badge">PREFIX</span>
-        </div>
-      </div>
-      <div class="cmd-card">
-        <div class="cmd-slug">@Glacian</div>
-        <div class="cmd-body">
-          <h4>AI Chat</h4>
-          <p>Mention Glacian or say its name to start a conversation. It has a witty personality and remembers context.</p>
-          <span class="cmd-badge">MENTION</span>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <hr class="divider">
-
-  <!-- CTA -->
-  <section>
-    <div class="cta-box">
-      <h2>Ready to join the ice world?</h2>
-      <p>Add Glacian to your server and start earning Snow Points today. Your journey to Rank #50 begins now.</p>
-      <a href="${BOT_INVITE}" class="btn btn-primary" target="_blank">Add Glacian to Your Server ❄️</a>
-    </div>
-  </section>
-
-</div>
-
-${FOOTER_HTML}
-</body></html>`;
-}
-
-function buildTermsPage() {
-  return `${HTML_COMMON_HEAD}
-<body>
-<div class="snow">${SNOWFLAKES}</div>
-${NAV}
-<div class="wrap legal-page">
-  <a href="/" class="back-link">← Back to Home</a>
-  <h1>Terms of Service</h1>
-  <p class="updated">Last updated: July 22, 2026</p>
-
-  <p>Welcome to <strong>Glacian</strong> ("the Bot", "we", "our"). By adding Glacian to your Discord server or using any of its features, you agree to these Terms of Service. If you do not agree, you must stop using the Bot immediately.</p>
-
-  <h2>1. Acceptance of Terms</h2>
-  <p>These Terms of Service govern your access to and use of the Glacian Discord bot and its associated web presence (glacian.onrender.com). By using the Bot, you represent that you are at least 13 years old (or the minimum age required in your jurisdiction to use Discord) and that you accept these Terms in full.</p>
-
-  <h2>2. Description of Service</h2>
-  <p>Glacian is a Discord bot that provides the following features:</p>
-  <ul>
-    <li>AFK (Away From Keyboard) status management within Discord servers</li>
-    <li>A "Snow Points" system that rewards AFK time</li>
-    <li>A 50-title progression system tied to Snow Points</li>
-    <li>Canvas-generated image cards (Snow Card, AFK Card, Title Card, Return Card, Mention Card)</li>
-    <li>Mention tracking and direct-message notifications while AFK</li>
-    <li>Timed AFK sessions with automatic expiration</li>
-    <li>Global and server-scoped AFK modes</li>
-    <li>Multi-language support (English, Spanish, Portuguese)</li>
-    <li>AI-powered chat responses via third-party language models</li>
-  </ul>
-
-  <h2>3. User Conduct</h2>
-  <p>You agree not to use Glacian to:</p>
-  <ul>
-    <li>Violate Discord's <a href="https://discord.com/terms" target="_blank">Terms of Service</a> or <a href="https://discord.com/guidelines" target="_blank">Community Guidelines</a></li>
-    <li>Harass, abuse, threaten, or otherwise harm other users</li>
-    <li>Spam commands or intentionally overload the bot</li>
-    <li>Attempt to exploit bugs, vulnerabilities, or race conditions in the bot</li>
-    <li>Use the bot for any illegal purpose</li>
-    <li>Set AFK reasons that contain hate speech, harassment, or prohibited content</li>
-  </ul>
-
-  <h2>4. AI-Generated Content</h2>
-  <p>Some Glacian responses are generated by third-party AI language models (Groq/LLaMA). These responses are generated automatically and do not represent the views of Glacian's developers. We are not responsible for the content of AI-generated messages, though we implement reasonable filters. If you receive inappropriate AI output, please contact the bot owner.</p>
-
-  <h2>5. Data Collection and Privacy</h2>
-  <p>Glacian collects and stores certain data to function properly. By using the bot, you consent to this data collection as described in our <a href="/privacy">Privacy Policy</a>. Data is stored in a cloud-hosted PostgreSQL database and is not sold to third parties.</p>
-
-  <h2>6. Availability and Uptime</h2>
-  <p>Glacian is provided on an "as-is" and "as-available" basis. We make no guarantees of uptime, availability, or uninterrupted service. The bot may be taken offline for maintenance, updates, or unexpected failures at any time without notice. Snow Points and session data are preserved across planned restarts through database persistence.</p>
-
-  <h2>7. Termination</h2>
-  <p>We reserve the right to ban any user or server from using Glacian at our sole discretion, particularly in cases of abuse, ToS violations, or conduct deemed harmful to the community. Users can remove the bot from their server at any time via Discord's server settings.</p>
-
-  <h2>8. Intellectual Property</h2>
-  <p>Glacian's code, canvas designs, title system, and branding are the property of the bot's developer (ultra3_dev). You may not copy, redistribute, or sell the bot's code or assets without explicit written permission.</p>
-
-  <h2>9. Limitation of Liability</h2>
-  <p>To the maximum extent permitted by applicable law, Glacian and its developers shall not be liable for any indirect, incidental, special, consequential, or punitive damages, including loss of data, arising from your use of or inability to use the bot. The bot is provided free of charge with no warranties.</p>
-
-  <h2>10. Changes to Terms</h2>
-  <p>We may update these Terms at any time. Continued use of Glacian after any changes constitutes acceptance of the updated Terms. Significant changes will be announced via the support server or the bot's status.</p>
-
-  <h2>11. Governing Law</h2>
-  <p>These Terms shall be governed by and construed in accordance with applicable laws. Any disputes shall be resolved in good faith between the parties.</p>
-
-  <h2>12. Contact</h2>
-  <p>For questions, abuse reports, or data requests, please contact the bot owner via Discord: <strong>ultra3_dev</strong>.</p>
-</div>
-${FOOTER_HTML}
-</body></html>`;
-}
-
-function buildPrivacyPage() {
-  return `${HTML_COMMON_HEAD}
-<body>
-<div class="snow">${SNOWFLAKES}</div>
-${NAV}
-<div class="wrap legal-page">
-  <a href="/" class="back-link">← Back to Home</a>
-  <h1>Privacy Policy</h1>
-  <p class="updated">Last updated: July 22, 2026</p>
-
-  <p>This Privacy Policy explains what information Glacian ("the Bot", "we", "our") collects from Discord users, how it is used, and your rights regarding that data.</p>
-
-  <h2>1. Information We Collect</h2>
-  <p>Glacian collects and stores the following data to provide its services:</p>
-  <ul>
-    <li><strong>Discord User ID</strong> — A unique numeric identifier assigned by Discord. Used to associate AFK sessions, Snow Points, and settings with your account.</li>
-    <li><strong>AFK Reason</strong> — The reason text you provide when going AFK. Stored temporarily while you are AFK; deleted when you return.</li>
-    <li><strong>AFK Timestamps</strong> — Start time, end time, and optional expiry time of your AFK session. Used to calculate duration and Snow Points earned.</li>
-    <li><strong>AFK Scope</strong> — Whether your AFK is Global (all servers) or Server-scoped. Stored with the session.</li>
-    <li><strong>Snow Points</strong> — Cumulative AFK time in seconds, total session count, and total points. Permanently stored to persist your progression.</li>
-    <li><strong>Mention Logs</strong> — When you are mentioned while AFK, we temporarily store: the mentioner's username, channel name, server name, and a preview of the message (up to 200 characters). These are deleted after being sent to you when you return from AFK.</li>
-    <li><strong>Language Preference</strong> — Your chosen display language (en, es, pt). Stored until changed or deleted.</li>
-    <li><strong>Notify Channel / Guild</strong> — The channel and server name where you activated AFK, used to send timer expiry notifications. Not stored permanently after AFK ends.</li>
-    <li><strong>Avatar Images</strong> — Your Discord avatar is fetched in real-time to generate canvas cards. It is not permanently stored — it is fetched, used for the image, and discarded.</li>
-  </ul>
-
-  <h2>2. Information We Do NOT Collect</h2>
-  <ul>
-    <li>Message content (beyond the AFK reason you explicitly provide and the 200-char mention preview)</li>
-    <li>Real names, email addresses, or any personal information outside of Discord</li>
-    <li>Voice channel activity or call participation</li>
-    <li>Private DM content (Glacian can only read DMs it is directly involved in)</li>
-    <li>Server role or permission data (beyond what Discord makes available in interactions)</li>
-  </ul>
-
-  <h2>3. How We Use Your Information</h2>
-  <ul>
-    <li>To manage your AFK status and notify other users when you are mentioned</li>
-    <li>To calculate and store your Snow Points and session statistics</li>
-    <li>To send you DMs with mention logs and timer expiry notifications</li>
-    <li>To generate canvas image cards displayed in Discord</li>
-    <li>To display messages in your preferred language</li>
-  </ul>
-
-  <h2>4. Data Storage</h2>
-  <p>All data is stored in a <strong>Neon PostgreSQL</strong> cloud database with SSL-encrypted connections. Data is hosted on servers in the United States. We implement reasonable technical security measures to protect stored data, but cannot guarantee absolute security.</p>
-
-  <h2>5. Data Retention</h2>
-  <ul>
-    <li><strong>AFK session data</strong>: Deleted automatically when you return from AFK (either by sending a message or via timer expiry).</li>
-    <li><strong>Mention logs</strong>: Deleted after being delivered to you via DM when your AFK ends.</li>
-    <li><strong>Snow Points and session stats</strong>: Retained indefinitely to preserve your progression. You may request deletion.</li>
-    <li><strong>Language preference</strong>: Retained until changed or deletion is requested.</li>
-  </ul>
-
-  <h2>6. Third-Party Services</h2>
-  <p>Glacian uses the following third-party services, each with their own privacy policies:</p>
-  <ul>
-    <li><strong>Discord Inc.</strong> — The platform Glacian operates on. <a href="https://discord.com/privacy" target="_blank">Discord Privacy Policy</a></li>
-    <li><strong>Neon</strong> — Cloud PostgreSQL database hosting. <a href="https://neon.tech/privacy-policy" target="_blank">Neon Privacy Policy</a></li>
-    <li><strong>Groq</strong> — AI language model API for generating messages. Messages sent to Groq include only the user's username and their AFK reason or chat message — no User IDs are transmitted. <a href="https://groq.com/privacy-policy/" target="_blank">Groq Privacy Policy</a></li>
-    <li><strong>Render</strong> — Bot hosting platform. <a href="https://render.com/privacy" target="_blank">Render Privacy Policy</a></li>
-    <li><strong>Google Fonts (Noto Color Emoji)</strong> — Emoji font downloaded at startup for canvas rendering. No user data is transmitted.</li>
-  </ul>
-
-  <h2>7. Server Members Intent</h2>
-  <p>Glacian requests the <strong>Server Members Intent</strong> to fetch member information when resolving AFK mentions. This allows the bot to correctly attribute AFK notifications to the right user. <strong>We do not store member lists or bulk member data.</strong></p>
-
-  <h2>8. Message Content Intent</h2>
-  <p>Glacian requests the <strong>Message Content Intent</strong> to:</p>
-  <ul>
-    <li>Detect when a user sends a message and should be removed from AFK status</li>
-    <li>Detect prefix commands (e.g. <code>gn afk</code>)</li>
-    <li>Detect when an AFK user is mentioned</li>
-    <li>Enable AI chat when the bot is mentioned or called by name</li>
-  </ul>
-  <p>Message content is not stored except for the brief mention preview (max 200 characters) which is deleted after being delivered to the AFK user.</p>
-  <p><strong>Users cannot opt out</strong> of AFK mention detection as it is a core feature of the bot. However, they can remove themselves from AFK at any time by sending any message. AI chat opt-out: simply do not mention or address the bot directly.</p>
-  <p><strong>Message content is not used to train AI or ML models.</strong> The Groq API used for AI responses has its own data usage policy (see above).</p>
-
-  <h2>9. Presence Intent</h2>
-  <p>Glacian does <strong>not</strong> currently use the Presence Intent. No activity or online status data is collected.</p>
-
-  <h2>10. Your Rights</h2>
-  <p>You have the right to:</p>
-  <ul>
-    <li><strong>Access</strong>: Request a summary of data stored for your Discord User ID.</li>
-    <li><strong>Deletion</strong>: Request all data associated with your User ID be permanently deleted. Note: deleting Snow Points and session data cannot be reversed.</li>
-    <li><strong>Correction</strong>: Report incorrect stored data (e.g. Snow Points issues).</li>
-  </ul>
-  <p>To exercise these rights, contact us via Discord: <strong>ultra3_dev</strong>. We will respond within 30 days.</p>
-
-  <h2>11. Children's Privacy</h2>
-  <p>Glacian is not directed to children under the age of 13. We do not knowingly collect data from children under 13. If you believe a child has provided data, contact us for removal.</p>
-
-  <h2>12. Changes to This Policy</h2>
-  <p>We may update this Privacy Policy periodically. The "Last updated" date at the top reflects the most recent revision. Continued use of Glacian after changes constitutes acceptance.</p>
-
-  <h2>13. Contact</h2>
-  <p>For privacy inquiries, data requests, or concerns, contact the bot owner on Discord: <strong>ultra3_dev</strong>.</p>
-</div>
-${FOOTER_HTML}
-</body></html>`;
-}
-
-const PORT = parseInt(process.env.PORT || '3000', 10);
-createServer((req, res) => {
-  const url = (req.url || '/').split('?')[0];
-
-  let body, status = 200;
-  if (url === '/' || url === '/index.html') {
-    body = buildHomePage();
-  } else if (url === '/terms' || url === '/terms.html') {
-    body = buildTermsPage();
-  } else if (url === '/privacy' || url === '/privacy.html') {
-    body = buildPrivacyPage();
-  } else if (url === '/health') {
-    res.writeHead(200, {'Content-Type':'application/json'});
-    res.end(JSON.stringify({status:'ok',bot:'Glacian',version:'2.1.0'}));
-    return;
-  } else {
-    status = 302;
-    res.writeHead(302, {Location: '/'});
-    res.end();
-    return;
-  }
-
-  res.writeHead(status, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-store',
-  });
-  res.end(body);
-}).listen(PORT, '0.0.0.0', () => {
-  console.log(`✅  HTTP server on port ${PORT} — website live at /  |  /terms  |  /privacy`);
-});
+// ─── WEB SERVER (see web.js) ────────────────────────────────────────────────
+// The landing page, terms, privacy and health endpoint live in web.js
+startWebServer();
 
 // ─── START ────────────────────────────────────────────────────────────────────
 if (!process.env.DISCORD_TOKEN) {
