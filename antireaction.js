@@ -979,7 +979,7 @@ export function buildAntiReactionSlash() {
     description: '🛡️ Anti-Reaction system — block forbidden emoji reactions',
     options: [
       {
-        type: 1, // SUB_COMMAND_GROUP
+        type: 2, // SUB_COMMAND_GROUP
         name: 'reaction',
         description: 'Manage the anti-reaction system',
         options: [
